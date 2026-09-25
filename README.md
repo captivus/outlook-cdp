@@ -6,6 +6,14 @@ rather than rules baked into a script.
 It exists because every one of the behaviours below cost a real mistake to learn, and the next agent
 should inherit them instead of rediscovering them.
 
+## Installation
+
+```sh
+pip install outlook-cdp
+```
+
+The `chrome-agent` command must also be installed and available on `PATH`.
+
 ```python
 from outlook_cdp import Session, Mailbox, guards
 
@@ -154,7 +162,7 @@ verified draft left open for a human to look at.
 python3 tests/test_text.py && python3 tests/test_guards.py
 ```
 
-23 tests, no browser required. They cover the text conversion and every guard, including the two cases
+33 tests, no browser required. They cover the text conversion and every guard, including the two cases
 that matter most: a blocked address hidden behind a display name, and a truncated paste.
 
 **Verified end to end against a real mailbox.** `tests/live_send_test.py` opens a compose pane, resolves a
@@ -176,3 +184,10 @@ defects: a session with no From chooser refused every send; a directory-resolved
 unreadable; an inline reply looked like no pane at all, so `send()` would have reported success without
 sending; the reading pane looked like an open composer; and discard silently did nothing on any draft with
 content.
+
+## Releasing
+
+Update the version in `pyproject.toml`, then publish a GitHub Release with a matching `v` tag (for
+example, `v0.1.0`). The release starts `.github/workflows/publish.yml`, which runs the offline tests,
+builds the package, and publishes through PyPI Trusted Publishing. The GitHub `pypi` environment and
+PyPI publisher must both be configured before the first release.
