@@ -1,5 +1,7 @@
 # outlook-cdp
 
+![Outlook compose pane passing sender, recipient, and message checks before sending](https://raw.githubusercontent.com/captivus/outlook-cdp/main/assets/readme-banner.png)
+
 Drive Outlook on the web through Chrome DevTools, with the pre-send checks as objects you compose
 rather than rules baked into a script.
 
@@ -191,3 +193,8 @@ Update the version in `pyproject.toml`, then publish a GitHub Release with a mat
 example, `v0.1.0`). The release starts `.github/workflows/publish.yml`, which runs the offline tests,
 builds the package, and publishes through PyPI Trusted Publishing. The GitHub `pypi` environment and
 PyPI publisher must both be configured before the first release.
+
+## Independence
+
+This is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft.
+Microsoft Outlook and its logo are trademarks of Microsoft Corporation.

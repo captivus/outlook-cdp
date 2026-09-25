@@ -12,5 +12,6 @@ dist/
 *.eml
 *.msg
 *.png
+!assets/readme-banner.png
 SEND_LOCK
 letter.txt
