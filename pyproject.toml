@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "outlook-cdp"
+version = "0.1.0"
+description = "Drive Outlook on the web through Chrome DevTools, with composable pre-send guards"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+outlook-cdp = "outlook_cdp.cli:main"
+
+[tool.setuptools]
+packages = ["outlook_cdp"]

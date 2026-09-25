@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Local mailbox data and artifacts from manual runs.
+.env
+.env.*
+*.csv
+*.eml
+*.msg
+*.png
+SEND_LOCK
+letter.txt
