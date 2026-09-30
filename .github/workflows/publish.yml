@@ -21,7 +21,7 @@ jobs:
             exit 1
           fi
       - name: Run offline tests
-        run: python3 tests/test_text.py && python3 tests/test_guards.py
+        run: python3 tests/test_text.py && python3 tests/test_guards.py && python3 tests/test_attachments.py && python3 tests/test_reading.py
       - run: uv build --no-sources
       - uses: actions/upload-artifact@v7
         with:

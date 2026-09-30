@@ -27,9 +27,9 @@ def test_the_sixty_character_heuristic_is_deliberate_and_has_a_cost():
 
 
 def test_short_lines_keep_their_breaks():
-    html = to_html("Example Organization\nPO Box 11\nExample City, ST 12345")
+    html = to_html("Example Organization\nPO Box 4242\nExample City, ST 12345")
     # one block, so the only paragraph separator is the trailing one; the two joins are the line breaks
-    assert "Example Organization<br>PO Box 11<br>Example City, ST 12345" in html
+    assert "Example Organization<br>PO Box 4242<br>Example City, ST 12345" in html
 
 
 def test_list_items_stay_on_their_own_lines():
