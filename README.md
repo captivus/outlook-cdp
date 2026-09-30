@@ -58,6 +58,57 @@ outlook-cdp --instance my-instance recipients     # what the open draft's chips 
 outlook-cdp --instance my-instance discard
 ```
 
+Reading is separate from sending, and needs no UI at all:
+
+```python
+from outlook_cdp import Session, attachments
+
+s = Session("my-chrome-agent-instance")
+
+# Every attachment on the thread the reading pane is showing, inline signature images excluded.
+for att in attachments.open_message_attachments(s):
+    print(att.name, att.content_type, att.size)
+
+# Or sweep the folder, newest first, and write everything to disk.
+for msg in attachments.messages_with_attachments(s, folder="inbox", top=50):
+    got = attachments.download_all(s, attachments.list_attachments(s, msg["Id"]), "out/")
+    for rec in got:
+        print(rec["bytes"], rec["sha256"], rec["magic_ok"], rec["path"])
+```
+
+Listing, message bodies and search work the same way — over the mailbox's own REST API, from inside
+the page, with no clicking and nothing marked read:
+
+```python
+from outlook_cdp import Session, Reader
+
+r = Reader(Session("my-chrome-agent-instance"))
+
+for row in r.list_folder("inbox", top=50):
+    print(row.received, row.sender, row.subject, row.message_count, row.unread)
+
+# The whole thread, oldest first, across every folder it touches.
+conv = r.conversation(row.conversation_id)
+for m in conv.messages:
+    print(m.index, m.received, m.folder, m.sender_address, len(m.body))
+
+# The newest message that did not come from this mailbox: "their reply", not our own last word.
+reply = r.reply_to(row.conversation_id)
+print(reply.sender, reply.received, reply.attachment_names)
+print(reply.body)                  # this message only; reply.full_body keeps the quoted trail
+
+for hit in r.search("some phrase"):          # individual messages, not collapsed threads
+    print(hit.folder, hit.received, hit.sender, hit.subject)
+```
+
+`Reader` also has a `*_dom` method for each of those, which drives the UI instead. They exist for a page
+with no usable token and they **mark what they open read**, so the REST calls are the ones to use.
+
+`download` refuses rather than leaving a file that is not the type it claims: it checks the response
+length, the magic bytes for the declared content type, and whether the first bytes are HTML or JSON —
+which is what an expired token or the wrong mailbox actually puts on disk. It clicks nothing, so it does
+not mark anything read.
+
 ## What it needs
 
 `chrome-agent` on the PATH, a running instance with Outlook on the web signed in, and Python 3.10+.
@@ -125,6 +176,119 @@ quietly wrong rather than loudly broken.
     created. The same Discard click left the pane open for twenty seconds without it and closed in under
     one with it.
 
+19. **A coordinate click outside the viewport is accepted and lands on nothing.** The reading pane scrolls
+    independently of the page, so on any message with a normal amount of text an attachment tile sits at a
+    y-coordinate well past `innerHeight`. `Input.dispatchMouseEvent` there returns success and does
+    nothing, and `dom.box_center` cannot catch it because the box is a perfectly healthy 32x46 — it is
+    simply off-screen. **This is not specific to attachments**: it applies to every control this library
+    clicks by coordinate. Scroll the element into view and re-measure first. It is the whole explanation
+    for "the click worked and no menu opened".
+20. **An attachment tile carries exactly one button, `More actions`.** The menu behind it does hold
+    *Preview / Copy / Download* — but only opens when the tile is on screen, per 19. There is no
+    `Download` control in the light DOM to find.
+21. **That Download is a `blob:` URL, so CDP cannot follow it.** Outlook fetches the bytes itself, wraps
+    them in a blob and triggers an anchor download; what CDP observes is `Page.downloadWillBegin` on a
+    blob it cannot read. Worse, `Page.setDownloadBehavior` set from a one-shot connection dies **with that
+    connection**, so the path is set for nobody by the time the click happens. Driving the UI is not a
+    usable way to get an attachment out.
+22. **Cookies do not authenticate Outlook's own API.** `fetch(url, {credentials: 'include'})` against the
+    page's own origin returns **401**. Outlook on the web is bearer-token authenticated throughout, and
+    the tokens are in the page's MSAL cache in `localStorage`, one per scope, under keys containing
+    `|accesstoken|`. `attachments.access_token` matches on the scope list rather than the key, because
+    MSAL's key format has changed before.
+23. **`/api/v2.0/me/` is the signed-in user, not the mailbox on screen.** Those are different accounts
+    whenever a shared mailbox is open — the normal case here. Reading `me` returns a hundred unrelated
+    messages and none of the attachments you can see, which reads exactly like an API that does not have
+    them. Every call must be scoped to `/api/v2.0/users/<mailbox>/`, taking the mailbox from the tab URL.
+24. **The reading pane's URL id is a *conversation* id, not a message id.** `/mail/<mailbox>/inbox/id/<x>`
+    addresses the thread, because Outlook groups by conversation. Feeding it to `/messages/<id>` answers
+    `404 … doesn't belong to the targeted mailbox`, which reads like a permissions problem and is a type
+    error. `$filter=ConversationId eq '<x>'` turns it back into messages — which is also the way past
+    conversation grouping generally, since the thread's members are all addressable even when the pane is
+    painting the wrong one.
+25. **An attachment's `Size` is not its content length.** It counts the MIME envelope and base64
+    expansion, and runs a few hundred bytes to a third over the file: 624,607 reported for a 624,077-byte
+    PDF, 22,409,319 for a 22,408,839-byte spreadsheet. Asserting equality against it fails on every
+    correct download; verify against the response's own length.
+26. **`$filter=HasAttachments eq true` and `$orderby=ReceivedDateTime desc` cannot be combined** — the
+    server answers `InefficientFilter`. Dropping the sort to keep the filter returns the mailbox
+    oldest-first, which is never what the caller wants, so sort server-side and filter locally.
+27. **Reading an attachment over the API does not mark the message read.** Verified: an unread message
+    still read unread after its attachment was downloaded in full. Opening the message in the UI to reach
+    the tile *does* mark it read, which is a real change to someone's mailbox — a second reason not to
+    drive the UI.
+28. **Bytes have to leave the page in slices.** The whole file can be fetched inside the page in one go,
+    but returning it from a single `Runtime.evaluate` puts a 28 MB base64 string through a subprocess pipe
+    for a 21 MB attachment. Park it on a page global — the page survives chrome-agent's per-command
+    connections — and copy it out a few MiB at a time. Inside the page, feed
+    `String.fromCharCode.apply` 32 KiB windows; spreading a multi-megabyte array into an argument list
+    overflows the call stack, and the RangeError points nowhere near the cause.
+
+29. **The reading pane's `/id/<…>` URL segment is a ConversationId, not a message id.** It looks like
+    a message id and is not one: `/messages/<it>` answers `404 … doesn't belong to the targeted mailbox`,
+    which reads like a permissions problem and is really a type error. `$filter=ConversationId eq '<it>'`
+    turns it back into individual messages, each with its own sender, timestamp and body.
+30. **Conversation grouping makes the reading pane serve the wrong message.** The pane renders the whole
+    thread, so taking the largest block of text returns the *oldest* message — for a reply to something
+    you sent, that is your own outgoing mail, and it looks exactly like a success. Three things that do
+    **not** fix it: the row's `Expand conversation` button, which flips the row's aria-label to
+    "Expanded", adds no `div[role=option]` child rows and reveals only a zero-size element; clicking the
+    expanded child labelled with the sender, which has no box to click; and navigating to the
+    `data-convid` URL, which is behaviour 29. What fixes it is treating the pane as a list of messages
+    and addressing them individually — or not using the pane at all.
+31. **A freshly opened thread expands only its newest message.** The others are one-line stubs with
+    sender, date, a text preview and **no body in the DOM at all**. A short thread, though, can come up
+    fully expanded, so neither "the first block" nor "the biggest block" is the message you want. A
+    trusted click on a stub renders it in place; the expansion that matters happens in the reading pane,
+    not in the message list.
+32. **The pane's per-message anchors are ids, not classes.** An expanded message is
+    `div[aria-label="Email message"]`; inside it Outlook emits `MSG_<id>_FROM`, `_TO`, `_CC`, `_BCC`,
+    `_DATETIME` and `_SUBJECT`, and the thread's subject is on `CONV_<id>_SUBJECT`. The thread is wrapped
+    in `div[aria-label="N messages"]`, present even for a single message, where it reads `"1 messages"` —
+    Outlook's grammar, not a typo. Every class name in the pane is a build hash and will change; these
+    do not.
+33. **`div[role=option]` is not only a message row.** Attachment tiles in the reading pane share the
+    role, so an unscoped `querySelectorAll('div[role=option]')` mixes attachments into a folder listing.
+    Scope row queries to `[role=listbox][aria-label^="Message list"]`.
+34. **The wake sequence is not a once-per-session call.** `Emulation.setFocusEmulationEnabled` plus
+    `Page.setWebLifecycleState {"state":"active"}` has to be re-asserted after every navigation. Run a
+    search in a backgrounded tab and the results list is *genuinely* empty — no rows, no "no results"
+    text, an empty container — until both land again. It is indistinguishable from a query that matched
+    nothing, and it was read as one.
+35. **The row `(N)` badge is a hint, not a thread length.** In one real folder it appeared on two threads
+    and was absent from seven others that demonstrably were threads, it vanished from both as soon as
+    they were read, and on one of the two it said 3 where the pane said 4. Threads are also counted
+    across folders, so a row whose thread is one message here plus one in Sent Items shows no badge at
+    all. `Expand conversation` being offered is the dependable "this is a thread" signal; a real count
+    needs the thread itself. Nor does the aria-label help: **`Collapsed` appears on single messages
+    too** — it describes the row widget, not the thread — and trusting it called nearly every row a
+    thread.
+36. **A DOM folder listing cannot be paged past one screenful.** Outlook's message list is a custom
+    virtual scroller: assigning `scrollTop` does nothing and reads back as 0, every ancestor of the
+    listbox reports `scrollHeight == clientHeight` so the element that scrolls is *inside* it,
+    `lastRow.scrollIntoView()` adds no rows, and `Input.dispatchMouseEvent {"type":"mouseWheel"}` —
+    the trusted scroll that would work — **never returns** over a one-shot CDP connection and times the
+    call out. Arrow keys would page it but move the selection, which marks messages read. In one mailbox
+    that ceiling was 23 rows of 88; the first row's `aria-setsize` gives the true total, so at least the
+    shortfall is detectable. Listing over REST has no such limit.
+37. **Outlook's search URL does not search.** `/mail/<mailbox>/search/id/<q>?q=<q>` renders the
+    unfiltered folder, which looks like a query that matched everything. Driving the search box does
+    work, and returns individual messages tagged with the folder each lives in, but only a
+    relevance-ranked "Top results" set. `$search` over REST returns the lot — though it **cannot** be
+    combined with `$orderby` (the server answers `SearchWithOrderBy`), so sort the results yourself.
+38. **Query results are HTML, and highlighted terms fragment the DOM.** In search results Outlook wraps
+    each matching term in `<mark>`, which splits one subject cell into several leaf nodes; reading leaves
+    directly returned a subject of "Assessment", then "Roll", as though they were separate columns, and
+    shifted every later column along by two. Bodies come back from REST as HTML unless you set a `Prefer`
+    header, and they are full of `&nbsp;` — invisible, everywhere in mail pasted out of Word, and enough
+    to make an otherwise identical body compare unequal.
+39. **A healthy box can still be unclickable.** The reading pane scrolls independently of the page, so an
+    element can have a 32x46 box at y=2100 in a 1321px viewport. `Input.dispatchMouseEvent` accepts those
+    coordinates, reports success, and the click lands on nothing — the whole of the "the click ran and
+    nothing happened" mystery. A box model cannot show it; compare the centre against `innerWidth` and
+    `innerHeight`, and scroll and **re-measure** before clicking, because the scroll is animated and a
+    rectangle taken in the same breath as the request to scroll describes where the element was.
+
 ## Design rules
 
 **Discover what the page offers; never assume one shape.** The same mailbox in two configurations differs
@@ -153,6 +317,8 @@ verified draft left open for a human to look at.
 | `outlook_cdp/dom.py` | the shadow-root piercing walk, box measurement, clicking the laid-out candidate |
 | `outlook_cdp/recipients.py` | reading addresses out of recipient chips, and reporting what could not be read |
 | `outlook_cdp/mail.py` | open / fill / read back / send, and discard |
+| `outlook_cdp/attachments.py` | enumerating and downloading attachments, read-only, without the attachment UI |
+| `outlook_cdp/reading.py` | folder listings, message bodies and search — over REST, with a DOM fallback |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |
 | `outlook_cdp/text.py` | plain text to Outlook HTML, and whitespace-normalised comparison |
 | `outlook_cdp/cli.py` | the command line |
@@ -161,11 +327,14 @@ verified draft left open for a human to look at.
 ## Tests
 
 ```
-python3 tests/test_text.py && python3 tests/test_guards.py
+python3 tests/test_text.py && python3 tests/test_guards.py && \
+    python3 tests/test_attachments.py && python3 tests/test_reading.py
 ```
 
-33 tests, no browser required. They cover the text conversion and every guard, including the two cases
-that matter most: a blocked address hidden behind a display name, and a truncated paste.
+84 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+that decides where bytes land and whether they are believed — including the three cases that matter most:
+a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
+to escape its destination directory.
 
 **Verified end to end against a real mailbox.** `tests/live_send_test.py` opens a compose pane, resolves a
 recipient, pastes a body, reads the whole thing back, runs every guard, **sends**, then finds the sent

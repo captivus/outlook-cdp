@@ -15,3 +15,7 @@ dist/
 !assets/readme-banner.png
 SEND_LOCK
 letter.txt
+
+# Sub-agent B: downloaded attachments and CDP event logs from live runs. Never commit
+# the owner's records into this shared library repo.
+.scratch/
