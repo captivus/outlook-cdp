@@ -16,6 +16,11 @@ opened from disk.  Three tabs, one per kind of decision the plan could not make:
 Each group is a table with one column per contact and one row per field.  A value found on only one
 contact is marked as such, a value that differs between contacts is marked as differing, and under the
 table each contact lists exactly what `dedupe.coverage_gaps` found it holds that the first one lacks.
+
+In the first two tabs each column also carries a decision: delete this contact, in favour of which other
+one, and - when that other one lacks something - an explicit acceptance of exactly what will be lost.  The
+page saves nothing anywhere but the viewer's own browser; "Download decisions" writes a file for
+``contacts dedupe-apply --decisions``, which re-checks every decision (`dedupe.checked_decisions`).
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ import html
 import json
 
 from .contacts import extended
-from .dedupe import display, ews_gaps, rest_gaps
+from .dedupe import coverage_gaps, display, ews_gaps, rest_gaps
 
 _NAME_FIELDS = [("Title", None, "DisplayNamePrefix"), ("Given name", "GivenName", None),
                 ("Middle name", "MiddleName", None), ("Surname", "Surname", None),
@@ -101,7 +106,29 @@ def _gaps(a: dict, b: dict, ignore) -> list[str]:
     return rest_gaps(a, b, ignore) or ews_gaps(a, b, ignore)
 
 
-def _table(entries: list[dict], folders: dict, ignore, note: str = "") -> str:
+def _decide_row(entries: list[dict]) -> str:
+    cells = "".join(
+        f"<td class='decide' data-col='{i}'><label class='del'><input type='checkbox' class='d-del'> Delete this "
+        f"contact</label><div class='d-more' hidden><label class='kp'>keeping <select class='d-keep'></select>"
+        f"</label><div class='d-loss'></div><label class='acc' hidden><input type='checkbox' class='d-acc'> "
+        f"I accept losing this</label></div></td>" for i in range(len(entries)))
+    return f"<tr class='decrow'><th scope='row'>Decision</th>{cells}</tr>"
+
+
+def _decision_data(entries: list[dict], ignore, planned: dict) -> str:
+    """What the page's script needs for one group: ids, names, and the loss of every possible deletion."""
+    loss = {}
+    for i, a in enumerate(entries):
+        for j, b in enumerate(entries):
+            if i != j:
+                loss[f"{i}>{j}"] = {"show": _gaps(a, b, ignore), "full": coverage_gaps(a, b, ignore)}
+    ids = [e["record"]["Id"] for e in entries]
+    data = {"ids": ids, "names": [display(e) for e in entries], "loss": loss,
+            "planned": {ids.index(d): ids.index(k) for d, k in planned.items() if d in ids and k in ids}}
+    return json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _table(entries: list[dict], folders: dict, ignore, note: str = "", decide: bool = False) -> str:
     cards = [dict(((sec, label), v) for sec, label, v in _rows(e, ignore)) for e in entries]
     order: list[tuple[str, str]] = []
     for e in entries:
@@ -147,7 +174,8 @@ def _table(entries: list[dict], folders: dict, ignore, note: str = "") -> str:
         items = "".join(f"<li>{html.escape(g)}</li>" for g in gaps[:40]) or "<li class='nothing'>nothing</li>"
         more = f"<li class='nothing'>…and {len(gaps) - 40} more</li>" if len(gaps) > 40 else ""
         holds.append(f"<div class='holds'><h4>{title}</h4><ul>{items}{more}</ul></div>")
-    return (f"{note}<div class='scroll'><table><thead><tr><th class='corner'></th>{head}</tr></thead>"
+    decision = _decide_row(entries) if decide else ""
+    return (f"{note}<div class='scroll'><table><thead><tr><th class='corner'></th>{head}</tr>{decision}</thead>"
             f"<tbody>{''.join(body)}</tbody></table></div><div class='holdsgrid'>{''.join(holds)}</div>")
 
 
@@ -158,13 +186,17 @@ def _photo(e: dict) -> str:
     return f"<img class='ph' alt='' src='data:{html.escape(p['type'])};base64,{p['b64']}'>"
 
 
-def _group(n: int, kind: str, entries: list[dict], folders: dict, ignore, note: str = "") -> str:
+def _group(n: int, kind: str, entries: list[dict], folders: dict, ignore, note: str = "",
+           planned: dict | None = None) -> str:
     names = sorted({display(e) for e in entries})
     search = html.escape(" ".join(names).lower())
     title = html.escape(" · ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else ""))
+    decide = kind != "group"
+    data = (f"<script type='application/json' class='gdata'>{_decision_data(entries, ignore, planned or {})}"
+            f"</script>") if decide else ""
     return (f"<details class='grp' data-kind='{kind}' data-search='{search}'><summary><span class='n'>{n}</span>"
-            f"<span class='t'>{title}</span><span class='c'>{len(entries)} contacts</span></summary>"
-            f"{_table(entries, folders, ignore, note)}</details>")
+            f"<span class='t'>{title}</span><span class='st'></span><span class='c'>{len(entries)} contacts</span>"
+            f"</summary>{data}{_table(entries, folders, ignore, note, decide)}</details>")
 
 
 def render(backup: dict, plan: dict) -> str:
@@ -180,14 +212,15 @@ def render(backup: dict, plan: dict) -> str:
         parts["name"].append([by[i] for i in ids if i in by])
     for d in plan["in_a_contact_group"]:
         parts["group"].append([by[d["keep"]["id"]], by[d["delete"]["id"]]])
-    notes = {"name": "<p class='why'>These share only a name. Copies that another fully holds are marked "
-                     "deletable in the plan; set <code>\"approved\": true</code> there to delete them.</p>",
+    planned = {d["delete"]["id"]: d["keep"]["id"] for g in plan["name_only"] for d in g["deletable"]}
+    notes = {"name": "<p class='why'>These share only a name. Where one copy is fully held by another, "
+                     "ticking Delete on it loses nothing; otherwise the page shows what would be lost.</p>",
              "group": "<p class='why'>The second column would be deleted - the first holds everything in it - "
                       "but its address is a member of a contact group, so it is left alone.</p>"}
     sections = []
     for kind in ("differ", "name", "group"):
         groups = sorted(parts[kind], key=lambda es: display(es[0]).lower())
-        sections.append("".join(_group(i, kind, es, folders, ignore, notes.get(kind, ""))
+        sections.append("".join(_group(i, kind, es, folders, ignore, notes.get(kind, ""), planned)
                                 for i, es in enumerate(groups, 1)))
     counts = {k: len(v) for k, v in parts.items()}
     return _PAGE.format(
@@ -196,7 +229,8 @@ def render(backup: dict, plan: dict) -> str:
         ignored=html.escape(", ".join(ignore) or "none"),
         body="".join(f"<section id='{k}' class='tab' {'hidden' if k != 'differ' else ''}>{s}</section>"
                      for k, s in zip(("differ", "name", "group"), sections)),
-        summary=html.escape(json.dumps(plan.get("summary", {}))))
+        summary=html.escape(json.dumps(plan.get("summary", {}))),
+        meta=json.dumps({"backup_taken_at": backup["taken_at"], "mailbox": backup["mailbox"]}))
 
 
 _PAGE = """<!doctype html>
@@ -204,12 +238,12 @@ _PAGE = """<!doctype html>
 <title>Contact Duplicates Review</title>
 <style>
 :root{{--bg:#f7f7f5;--panel:#fff;--ink:#1d1d1b;--muted:#6b6b66;--line:#e3e2dd;--only:#e6f4ea;--only-ink:#14532d;
---diff:#fff4d6;--diff-ink:#7a4b00;--none:#fafaf8;--accent:#2f5bd3;--sec:#f1f0ec}}
+--diff:#fff4d6;--diff-ink:#7a4b00;--none:#fafaf8;--accent:#2f5bd3;--sec:#f1f0ec;--bad:#b42318}}
 @media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#151514;--panel:#1e1e1c;--ink:#ecebe6;
 --muted:#9c9b94;--line:#33322f;--only:#163a24;--only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;
---accent:#8fb0ff;--sec:#262624}}}}
+--accent:#8fb0ff;--sec:#262624;--bad:#ff8a80}}}}
 :root[data-theme="dark"]{{--bg:#151514;--panel:#1e1e1c;--ink:#ecebe6;--muted:#9c9b94;--line:#33322f;--only:#163a24;
---only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;--accent:#8fb0ff;--sec:#262624}}
+--only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;--accent:#8fb0ff;--sec:#262624;--bad:#ff8a80}}
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}}
 header{{padding:20px 16px 8px;max-width:1400px;margin:0 auto}}
@@ -246,6 +280,17 @@ td.none{{background:var(--none);color:var(--muted)}}
 .holds h4{{margin:4px 0;font-size:12px;color:var(--muted);font-weight:600}}
 .holds ul{{margin:0;padding-left:18px;font-size:13px}} .holds li{{overflow-wrap:anywhere}} .nothing{{color:var(--muted);list-style:none;margin-left:-18px}}
 .why{{margin:10px 14px 0;color:var(--muted);font-size:13px}}
+tr.decrow th,tr.decrow td{{background:var(--sec);border-bottom:2px solid var(--line);font-size:13px}}
+td.decide label{{display:block;cursor:pointer}} td.decide select{{font:inherit;max-width:100%;margin-top:4px;
+background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px}}
+td.decide.on{{background:var(--diff)}} td.decide.on.bad{{outline:2px solid var(--bad);outline-offset:-2px}}
+.d-loss{{margin:6px 0;font-size:12px}} .d-loss ul{{margin:2px 0;padding-left:16px}} .d-loss .ok{{color:var(--only-ink)}}
+.d-loss .warn{{color:var(--bad);font-weight:600}} .acc{{font-weight:600}}
+.grp summary .st{{font-size:12px;white-space:nowrap}} .st.ok{{color:var(--only-ink)}} .st.bad{{color:var(--bad)}}
+.dl{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}} .dl button{{font:inherit;border:1px solid var(--accent);
+background:var(--accent);color:var(--panel);padding:6px 12px;border-radius:8px;cursor:pointer}}
+.dl button.ghost{{background:none;color:var(--accent)}} .dl button:disabled{{opacity:.45;cursor:not-allowed}}
+.dl .msg{{font-size:12px;color:var(--muted)}}
 code{{font-size:12px}}
 </style></head><body>
 <header><h1>Contact duplicates to review</h1>
@@ -260,6 +305,8 @@ code{{font-size:12px}}
 <span class="legend"><span><span class="sw" style="background:var(--only)"></span>only on this contact</span>
 <span><span class="sw" style="background:var(--diff)"></span>differs between contacts</span>
 <span><span class="sw" style="background:var(--none)"></span>missing here</span></span>
+<span class="dl"><button id="dl" disabled>Download decisions</button><button id="clr" class="ghost">Clear all</button>
+<span class="msg" id="msg">No decisions yet.</span></span>
 </div></div>
 <main>{body}</main>
 <script>
@@ -272,6 +319,64 @@ function filter(){{const t=q.value.trim().toLowerCase();
 q.oninput=filter;
 document.querySelectorAll('[data-act]').forEach(b=>b.onclick=()=>current().querySelectorAll('.grp:not([hidden])')
   .forEach(g=>g.open=b.dataset.act==='open'));
+</script>
+<script>
+const META={meta}, KEY='dedupe-decisions:'+META.mailbox+':'+META.backup_taken_at;
+const groups=[...document.querySelectorAll('.grp')].filter(g=>g.querySelector('.gdata'))
+  .map((el,gi)=>({{el,gi,data:JSON.parse(el.querySelector('.gdata').textContent)}}));
+let state={{}};
+try{{state=JSON.parse(localStorage.getItem(KEY)||'{{}}')}}catch(e){{state={{}}}}
+function save(){{try{{localStorage.setItem(KEY,JSON.stringify(state))}}catch(e){{}}}}
+function esc(t){{const d=document.createElement('div');d.textContent=t;return d.innerHTML}}
+function deletedIds(){{const s=new Set();groups.forEach(g=>Object.entries(state[g.gi]||{{}}).forEach(([c,v])=>v.del&&s.add(g.data.ids[c])));return s}}
+function render(g){{
+  const st=state[g.gi]||(state[g.gi]={{}}), n=g.data.ids.length, gone=deletedIds();
+  const kept=[...Array(n).keys()].filter(c=>!(st[c]&&st[c].del));
+  let bad=0, dels=0;
+  g.el.querySelectorAll('td.decide').forEach(td=>{{
+    const c=+td.dataset.col, v=st[c]||(st[c]={{}}), more=td.querySelector('.d-more'), sel=td.querySelector('.d-keep');
+    td.querySelector('.d-del').checked=!!v.del; more.hidden=!v.del; td.classList.toggle('on',!!v.del);
+    if(!v.del){{td.classList.remove('bad');return}}
+    dels++;
+    const opts=kept.filter(k=>!gone.has(g.data.ids[k]));
+    if(!opts.includes(v.keep)) v.keep=opts.includes(g.data.planned[c])?g.data.planned[c]:opts[0];
+    sel.innerHTML=opts.map(k=>`<option value="${{k}}">column ${{k+1}}: ${{esc(g.data.names[k])}}</option>`).join('');
+    const box=td.querySelector('.d-loss'), acc=td.querySelector('.acc');
+    if(v.keep===undefined){{box.innerHTML='<span class="warn">Keep at least one contact in this group.</span>';
+      acc.hidden=true;td.classList.add('bad');bad++;return}}
+    sel.value=v.keep;
+    const L=g.data.loss[c+'>'+v.keep];
+    if(!L.full.length){{box.innerHTML='<span class="ok">Nothing is lost: that contact holds everything in this one.</span>';
+      acc.hidden=true;v.acc=false}}
+    else{{box.innerHTML='<span class="warn">Would be lost:</span><ul>'+L.show.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+      acc.hidden=false;td.querySelector('.d-acc').checked=!!v.acc}}
+    const need=L.full.length&&!v.acc; td.classList.toggle('bad',!!need); if(need) bad++;
+  }});
+  const chip=g.el.querySelector('.st');
+  chip.className='st'+(dels?(bad?' bad':' ok'):'');
+  chip.textContent=dels?(bad?`${{bad}} need attention`:`deleting ${{dels}}`):'';
+}}
+function decisions(){{const out=[];let pending=0;
+  groups.forEach(g=>Object.entries(state[g.gi]||{{}}).forEach(([c,v])=>{{if(!v.del)return;
+    const L=v.keep===undefined?null:g.data.loss[c+'>'+v.keep];
+    if(!L||(L.full.length&&!v.acc)){{pending++;return}}
+    out.push({{delete:g.data.ids[c],keep:g.data.ids[v.keep],delete_name:g.data.names[c],keep_name:g.data.names[v.keep],
+      accepted_loss:L.full}})}}));return {{out,pending}}}}
+function refresh(){{groups.forEach(render);save();const {{out,pending}}=decisions();
+  document.getElementById('dl').disabled=!out.length||pending>0;
+  document.getElementById('msg').textContent=!out.length&&!pending?'No decisions yet.':
+    `${{out.length}} deletion${{out.length==1?'':'s'}} decided`+(pending?` · ${{pending}} need you to accept a loss or keep a contact`:'')}}
+groups.forEach(g=>g.el.querySelectorAll('td.decide').forEach(td=>{{const c=+td.dataset.col;
+  const v=()=>((state[g.gi]||(state[g.gi]={{}}))[c]||(state[g.gi][c]={{}}));
+  td.querySelector('.d-del').onchange=e=>{{v().del=e.target.checked;v().acc=false;refresh()}};
+  td.querySelector('.d-keep').onchange=e=>{{v().keep=+e.target.value;v().acc=false;refresh()}};
+  td.querySelector('.d-acc').onchange=e=>{{v().acc=e.target.checked;refresh()}};}}));
+document.getElementById('clr').onclick=()=>{{if(confirm('Clear every decision on this page?')){{state={{}};refresh()}}}};
+document.getElementById('dl').onclick=()=>{{const {{out}}=decisions();
+  const doc={{format:1,backup_taken_at:META.backup_taken_at,mailbox:META.mailbox,made_at:new Date().toISOString(),decisions:out}};
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(doc,null,1)],{{type:'application/json'}}));
+  a.download='decisions-'+META.backup_taken_at+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}};
+refresh();
 </script>
 <!-- plan summary: {summary} -->
 </body></html>

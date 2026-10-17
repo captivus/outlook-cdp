@@ -56,6 +56,11 @@ changed since the backup, re-runs `coverage_gaps` on the live copies, deletes at
 the deleted one is gone and the kept one is still there.  The server takes no precondition on a delete, so
 the gap between that last read and the delete can be narrowed but not closed; a contact edited inside it
 is still whole in Deleted Items.  Every step is written to a JSON-lines log as it happens.
+
+A person can also decide, on the review page (`dedupe_review`), to delete a contact although it holds
+something its keeper lacks.  Such a decision names the keeper and lists exactly what will be lost;
+`checked_decisions` refuses it unless that list is what the backup shows, and `apply` refuses it if the
+live copies would lose anything more.
 """
 from __future__ import annotations
 
@@ -571,8 +576,51 @@ def _name_pairs(p: dict) -> set[tuple[str, str]]:
     return {(d["delete"]["id"], d["keep"]["id"]) for g in p["name_only"] for d in g["deletable"]}
 
 
-def apply(book: Contacts, p: dict, backup: dict, log_path: str, *, limit: int | None = None) -> dict:
-    """Carry out a reviewed plan, re-verifying every deletion against the live book.  See the module notes."""
+def review_groups(p: dict) -> list[list[str]]:
+    """The groups a plan leaves for a person: each a list of contact ids, as the review page shows them."""
+    return ([[c["id"] for c in x["contacts"]] for x in p["kept_with_differences"]] +
+            [[c["id"] for c in g["kept"]] + [d["delete"]["id"] for d in g["deletable"]] for g in p["name_only"]])
+
+
+def checked_decisions(p: dict, backup: dict, decisions: dict) -> list[dict]:
+    """A person's decisions from the review page, checked against the backup, as deletions with accepted loss.
+
+    Each decision deletes one contact in favour of another in the same review group, and lists exactly what
+    the person accepted losing.  That list must equal what `coverage_gaps` finds in the backup now, so a
+    decision cannot accept less than it loses, and a stale or edited decisions file is refused whole.
+    """
+    if decisions.get("backup_taken_at") != backup["taken_at"] or decisions.get("mailbox") != backup["mailbox"]:
+        raise OutlookError("these decisions were not made from this backup")
+    together = {}
+    for n, ids in enumerate(review_groups(p)):
+        for i in ids:
+            together.setdefault(i, set()).add(n)
+    by = {e["record"]["Id"]: e for e in backup["contacts"]}
+    folders = {f["id"]: f["name"] for f in backup["folders"]}
+    ignore = p.get("ignore_categories") or ()
+    out = []
+    for d in decisions.get("decisions") or []:
+        dup, keep = d.get("delete"), d.get("keep")
+        if dup == keep or dup not in by or keep not in by or not together.get(dup, set()) & together.get(keep, set()):
+            raise OutlookError(f"a decision pairs contacts that are not in one review group: {dup} / {keep}")
+        loss = coverage_gaps(by[dup], by[keep], ignore)
+        if sorted(loss) != sorted(d.get("accepted_loss") or []):
+            raise OutlookError(f"a decision about {display(by[dup])!r} accepts a different loss than the backup "
+                               f"shows; make the review page again from this backup and plan")
+        out.append({**_item(by[dup], by[keep], folders), "accepted_loss": loss})
+    deleted = [d["delete"]["id"] for d in out]
+    if len(set(deleted)) != len(deleted):
+        raise OutlookError("the decisions delete one contact twice")
+    return out
+
+
+def apply(book: Contacts, p: dict, backup: dict, log_path: str, *, limit: int | None = None,
+          decisions: dict | None = None) -> dict:
+    """Carry out a reviewed plan, re-verifying every deletion against the live book.  See the module notes.
+
+    `decisions` (from the review page) adds deletions a person chose despite a loss they accepted; each is
+    carried out only if the live copies lose no more than that.
+    """
     if p["backup_taken_at"] != backup["taken_at"] or p["mailbox"] != backup["mailbox"]:
         raise OutlookError("this plan was not made from this backup")
     if book.mailbox != backup["mailbox"]:
@@ -587,7 +635,10 @@ def apply(book: Contacts, p: dict, backup: dict, log_path: str, *, limit: int | 
     members_now = {_t((m.get("Mailbox") or {}).get("EmailAddress"))
                    for f in book.folders() for g in book.groups(f["id"]) for m in g.get("Members") or []
                    if (m.get("Mailbox") or {}).get("EmailAddress")}
-    todo = approved(p)[:limit] if limit else approved(p)
+    chosen = checked_decisions(p, backup, decisions) if decisions else []
+    allowed |= {(d["delete"]["id"], d["keep"]["id"]) for d in chosen}
+    everything = approved(p) + chosen
+    todo = everything[:limit] if limit else everything
     deleting = {d["delete"]["id"] for d in todo}
     tally = {"deleted": 0, "skipped": 0}
     with open(log_path, "a", encoding="utf-8") as log:
@@ -640,8 +691,9 @@ def apply(book: Contacts, p: dict, backup: dict, log_path: str, *, limit: int | 
             pics = book.photos([dup_id, keep_id])
             dup["photo"], keep["photo"] = pics[dup_id], pics[keep_id]
             gaps = coverage_gaps(dup, keep, ignore)
-            if gaps:
-                note(item, "skipped", "live copy holds more than the kept one: " + "; ".join(gaps))
+            extra = sorted(set(gaps) - set(item.get("accepted_loss") or []))
+            if extra:
+                note(item, "skipped", "live copy holds more than the kept one: " + "; ".join(extra))
                 continue
             book.delete(dup_id)
             if book.get_raw(dup_id) is not None:
