@@ -18,7 +18,9 @@ contact is marked as such, a value that differs between contacts is marked as di
 table each contact lists exactly what `dedupe.coverage_gaps` found it holds that the first one lacks.
 
 In the first two tabs each column also carries a decision: delete this contact, in favour of which other
-one, and - when that other one lacks something - an explicit acceptance of exactly what will be lost.  The
+one, and - when that other one lacks something - an explicit acceptance of exactly what will be lost.  Vim-like
+keys make it quick to go through: ``j``/``k`` between groups, ``h``/``l`` between contacts, ``d`` to delete,
+``a`` to accept a loss, ``m`` to mark a group reviewed and jump to the next one, ``?`` for the rest.  The
 page saves nothing anywhere but the viewer's own browser; "Download decisions" writes a file for
 ``contacts dedupe-apply --decisions``, which re-checks every decision (`dedupe.checked_decisions`).
 """
@@ -194,7 +196,9 @@ def _group(n: int, kind: str, entries: list[dict], folders: dict, ignore, note: 
     decide = kind != "group"
     data = (f"<script type='application/json' class='gdata'>{_decision_data(entries, ignore, planned or {})}"
             f"</script>") if decide else ""
-    return (f"<details class='grp' data-kind='{kind}' data-search='{search}'><summary><span class='n'>{n}</span>"
+    key = html.escape(kind + ":" + entries[0]["record"]["Id"])
+    return (f"<details class='grp' data-kind='{kind}' data-key='{key}' data-search='{search}'>"
+            f"<summary><span class='n'>{n}</span>"
             f"<span class='t'>{title}</span><span class='st'></span><span class='c'>{len(entries)} contacts</span>"
             f"</summary>{data}{_table(entries, folders, ignore, note, decide)}</details>")
 
@@ -230,7 +234,8 @@ def render(backup: dict, plan: dict) -> str:
         body="".join(f"<section id='{k}' class='tab' {'hidden' if k != 'differ' else ''}>{s}</section>"
                      for k, s in zip(("differ", "name", "group"), sections)),
         summary=html.escape(json.dumps(plan.get("summary", {}))),
-        meta=json.dumps({"backup_taken_at": backup["taken_at"], "mailbox": backup["mailbox"]}))
+        meta=json.dumps({"backup_taken_at": backup["taken_at"], "mailbox": backup["mailbox"]}),
+        keys=_KEYS_JS, keyhelp=_KEY_HELP)
 
 
 _PAGE = """<!doctype html>
@@ -238,12 +243,12 @@ _PAGE = """<!doctype html>
 <title>Contact Duplicates Review</title>
 <style>
 :root{{--bg:#f7f7f5;--panel:#fff;--ink:#1d1d1b;--muted:#6b6b66;--line:#e3e2dd;--only:#e6f4ea;--only-ink:#14532d;
---diff:#fff4d6;--diff-ink:#7a4b00;--none:#fafaf8;--accent:#2f5bd3;--sec:#f1f0ec;--bad:#b42318}}
+--diff:#fff4d6;--diff-ink:#7a4b00;--none:#fafaf8;--accent:#2f5bd3;--sec:#f1f0ec;--bad:#b42318;--focus:rgba(47,91,211,.10)}}
 @media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#151514;--panel:#1e1e1c;--ink:#ecebe6;
 --muted:#9c9b94;--line:#33322f;--only:#163a24;--only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;
---accent:#8fb0ff;--sec:#262624;--bad:#ff8a80}}}}
+--accent:#8fb0ff;--sec:#262624;--bad:#ff8a80;--focus:rgba(143,176,255,.12)}}}}
 :root[data-theme="dark"]{{--bg:#151514;--panel:#1e1e1c;--ink:#ecebe6;--muted:#9c9b94;--line:#33322f;--only:#163a24;
---only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;--accent:#8fb0ff;--sec:#262624;--bad:#ff8a80}}
+--only-ink:#b7ebc6;--diff:#3d3213;--diff-ink:#f3d58b;--none:#1a1a18;--accent:#8fb0ff;--sec:#262624;--bad:#ff8a80;--focus:rgba(143,176,255,.12)}}
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}}
 header{{padding:20px 16px 8px;max-width:1400px;margin:0 auto}}
@@ -291,6 +296,17 @@ td.decide.on{{background:var(--diff)}} td.decide.on.bad{{outline:2px solid var(-
 background:var(--accent);color:var(--panel);padding:6px 12px;border-radius:8px;cursor:pointer}}
 .dl button.ghost{{background:none;color:var(--accent)}} .dl button:disabled{{opacity:.45;cursor:not-allowed}}
 .dl .msg{{font-size:12px;color:var(--muted)}}
+.grp.kf{{outline:2px solid var(--accent);outline-offset:1px}}
+.kc{{background-image:linear-gradient(var(--focus),var(--focus))}} thead th.kc{{box-shadow:inset 0 -3px 0 var(--accent)}}
+.grp.reviewed summary .t::after{{content:"  ✓ reviewed";color:var(--only-ink);font-weight:400;font-size:12px}}
+.hint{{font-size:12px;color:var(--muted)}} kbd{{font:12px ui-monospace,monospace;border:1px solid var(--line);
+border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--panel);color:var(--ink)}}
+#help{{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink);padding:16px 20px;
+max-width:min(720px,calc(100vw - 32px))}} #help::backdrop{{background:rgba(0,0,0,.45)}}
+#help h2{{font-size:16px;margin:0 0 8px}} #help table{{min-width:0}} #help td,#help th{{padding:3px 8px;border:none;
+min-width:0;font-size:13px}} #help th{{color:var(--muted);font-weight:600;text-align:left;padding-top:10px}}
+#keyecho{{position:fixed;right:16px;bottom:16px;font:13px ui-monospace,monospace;background:var(--panel);
+border:1px solid var(--line);border-radius:6px;padding:2px 8px;color:var(--muted)}} #keyecho:empty{{display:none}}
 code{{font-size:12px}}
 </style></head><body>
 <header><h1>Contact duplicates to review</h1>
@@ -307,6 +323,7 @@ code{{font-size:12px}}
 <span><span class="sw" style="background:var(--none)"></span>missing here</span></span>
 <span class="dl"><button id="dl" disabled>Download decisions</button><button id="clr" class="ghost">Clear all</button>
 <span class="msg" id="msg">No decisions yet.</span></span>
+<span class="hint">Press <kbd>?</kbd> for keyboard shortcuts</span>
 </div></div>
 <main>{body}</main>
 <script>
@@ -378,6 +395,110 @@ document.getElementById('dl').onclick=()=>{{const {{out}}=decisions();
   a.download='decisions-'+META.backup_taken_at+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}};
 refresh();
 </script>
+<dialog id="help" aria-label="Keyboard shortcuts">{keyhelp}</dialog><div id="keyecho" aria-live="polite"></div>
+<script>{keys}</script>
 <!-- plan summary: {summary} -->
 </body></html>
+"""
+
+
+_KEY_HELP = """<h2>Keyboard shortcuts</h2><table>
+<tr><th colspan=2>Moving</th></tr>
+<tr><td><kbd>j</kbd> <kbd>k</kbd></td><td>next / previous group (opens it, closes the last; a count works: <kbd>5</kbd><kbd>j</kbd>)</td></tr>
+<tr><td><kbd>n</kbd> <kbd>N</kbd></td><td>next / previous group not yet reviewed or decided</td></tr>
+<tr><td><kbd>g</kbd><kbd>g</kbd> <kbd>G</kbd></td><td>first / last group</td></tr>
+<tr><td><kbd>h</kbd> <kbd>l</kbd></td><td>previous / next contact (column) in the group</td></tr>
+<tr><td><kbd>o</kbd> <kbd>Enter</kbd></td><td>open or close the group</td></tr>
+<tr><td><kbd>z</kbd><kbd>z</kbd></td><td>scroll the group to the top again</td></tr>
+<tr><td><kbd>g</kbd><kbd>t</kbd> <kbd>g</kbd><kbd>T</kbd></td><td>next / previous tab</td></tr>
+<tr><td><kbd>/</kbd> <kbd>Esc</kbd></td><td>filter by name / leave the filter</td></tr>
+<tr><th colspan=2>Deciding (on the focused contact)</th></tr>
+<tr><td><kbd>d</kbd></td><td>delete this contact, or undo that</td></tr>
+<tr><td><kbd>s</kbd> <kbd>S</kbd></td><td>switch which contact it gives way to</td></tr>
+<tr><td><kbd>a</kbd></td><td>accept the loss shown, or withdraw it</td></tr>
+<tr><td><kbd>c</kbd></td><td>clear every decision in this group</td></tr>
+<tr><td><kbd>m</kbd></td><td>mark the group reviewed and go to the next unreviewed one (again to unmark)</td></tr>
+<tr><td><kbd>u</kbd></td><td>undo the last change</td></tr>
+<tr><td><kbd>W</kbd></td><td>download decisions</td></tr>
+<tr><td><kbd>?</kbd></td><td>this help</td></tr></table>"""
+
+_KEYS_JS = r"""
+(()=>{
+const RKEY=KEY+':reviewed', help=document.getElementById('help'), echo=document.getElementById('keyecho');
+let reviewed={}; try{reviewed=JSON.parse(localStorage.getItem(RKEY)||'{}')}catch(e){reviewed={}}
+let count='', prefix='', el=null, col=0; const undo=[];
+const tabsB=[...document.querySelectorAll('[data-tab]')];
+const vis=()=>[...current().querySelectorAll('.grp')].filter(g=>!g.hidden);
+const info=g=>groups.find(x=>x.el===g);
+const cols=g=>g.querySelectorAll('thead th[scope=col]').length;
+function saveR(){try{localStorage.setItem(RKEY,JSON.stringify(reviewed))}catch(e){}}
+function snap(){undo.push(JSON.stringify({state,reviewed}));if(undo.length>300)undo.shift()}
+function decided(g){const i=info(g);return !!i&&Object.values(state[i.gi]||{}).some(v=>v.del)}
+function paintReviewed(){document.querySelectorAll('.grp').forEach(g=>g.classList.toggle('reviewed',!!reviewed[g.dataset.key]))}
+function paint(){
+  document.querySelectorAll('.kf').forEach(x=>x.classList.remove('kf'));
+  document.querySelectorAll('.kc').forEach(x=>x.classList.remove('kc'));
+  paintReviewed();
+  if(!el)return;
+  el.classList.add('kf');
+  if(!el.open)return;
+  col=Math.max(0,Math.min(col,cols(el)-1));
+  el.querySelectorAll('table tr').forEach(tr=>{const c=tr.children[col+1];if(c&&!tr.classList.contains('sec'))c.classList.add('kc')});
+}
+function go(g,{keepCol=false}={}){
+  if(!g)return;
+  if(el&&el!==g)el.open=false;
+  el=g; el.open=true; if(!keepCol)col=0; paint();
+  el.scrollIntoView({block:'start'}); window.scrollBy(0,-(document.querySelector('.bar').offsetHeight+8));
+}
+function step(n){const v=vis();if(!v.length)return;let i=v.indexOf(el);
+  i=i<0?(n>0?0:v.length-1):Math.max(0,Math.min(v.length-1,i+n));go(v[i])}
+function next(dir){const v=vis();let i=v.indexOf(el);
+  for(let k=1;k<=v.length;k++){const g=v[(i+dir*k+v.length*k)%v.length];
+    if(!reviewed[g.dataset.key]&&!decided(g))return go(g)}
+  flash('every group here is reviewed or decided')}
+function cell(){const i=el&&info(el);if(!i)return null;const st=state[i.gi]||(state[i.gi]={});
+  return {i,v:st[col]||(st[col]={}),td:el.querySelector(`td.decide[data-col='${col}']`)}}
+function change(fn){snap();fn();refresh();paint()}
+function flash(t){echo.textContent=t;clearTimeout(flash.t);flash.t=setTimeout(()=>echo.textContent='',1600)}
+function tab(dir){const i=tabsB.findIndex(b=>b.getAttribute('aria-selected')==='true');
+  tabsB[(i+dir+tabsB.length)%tabsB.length].click();el=null;step(1)}
+const acts={
+  j:n=>step(n), k:n=>step(-n), G:()=>{const v=vis();go(v[v.length-1])},
+  n:()=>next(1), N:()=>next(-1),
+  h:n=>{if(el){el.open=true;col-=n;paint()}}, l:n=>{if(el){el.open=true;col+=n;paint()}},
+  o:()=>{if(el){el.open=!el.open;paint()}}, Enter:()=>acts.o(),
+  d:()=>{const c=cell();if(!c)return flash('no decisions in this tab');change(()=>{c.v.del=!c.v.del;c.v.acc=false})},
+  s:()=>cycle(1), S:()=>cycle(-1),
+  a:()=>{const c=cell();if(!c||!c.v.del)return flash('tick d first');
+    if(c.td.querySelector('.acc').hidden)return flash('nothing to accept: nothing is lost');
+    change(()=>{c.v.acc=!c.v.acc})},
+  c:()=>{const i=el&&info(el);if(i)change(()=>{state[i.gi]={}})},
+  m:()=>{if(!el)return;const k=el.dataset.key;change(()=>{reviewed[k]=!reviewed[k];saveR()});if(reviewed[k])next(1)},
+  u:()=>{const s=undo.pop();if(!s)return flash('nothing to undo');const o=JSON.parse(s);
+    state=o.state;reviewed=o.reviewed;saveR();refresh();paint();flash('undone')},
+  W:()=>{const b=document.getElementById('dl');if(b.disabled)return flash(document.getElementById('msg').textContent);b.click()},
+  '/':()=>q.focus(), '?':()=>help.open?help.close():help.showModal(),
+};
+function cycle(dir){const c=cell();if(!c||!c.v.del)return flash('tick d first');
+  const opts=[...c.td.querySelectorAll('.d-keep option')].map(o=>+o.value);if(opts.length<2)return flash('only one contact to keep');
+  change(()=>{c.v.keep=opts[(opts.indexOf(c.v.keep)+dir+opts.length)%opts.length];c.v.acc=false})}
+const twos={gg:()=>{const v=vis();go(v[0])}, gt:()=>tab(1), gT:()=>tab(-1),
+  zz:()=>el&&go(el,{keepCol:true})};
+document.addEventListener('keydown',e=>{
+  const t=e.target, typing=/^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)&&t.type!=='checkbox';
+  if(e.key==='Escape'){if(help.open)help.close();if(typing)t.blur();count='';prefix='';echo.textContent='';return}
+  if(typing||e.ctrlKey||e.metaKey||e.altKey)return;
+  if(help.open&&e.key!=='?')return;
+  const k=e.key;
+  if(prefix){const f=twos[prefix+k];prefix='';echo.textContent='';if(f){e.preventDefault();f()}return}
+  if(/^[0-9]$/.test(k)&&(count||k!=='0')){count+=k;echo.textContent=count;e.preventDefault();return}
+  if(k==='g'||k==='z'){prefix=k;echo.textContent=count+k;e.preventDefault();return}
+  const f=acts[k];if(!f){count='';return}
+  e.preventDefault();const n=Math.max(1,parseInt(count||'1',10));count='';echo.textContent='';f(n);
+});
+document.querySelectorAll('.grp').forEach(g=>g.addEventListener('toggle',()=>{if(g.open&&el!==g){el=g;col=0}paint()}));
+document.querySelectorAll('td.decide').forEach(td=>td.addEventListener('click',()=>{col=+td.dataset.col;paint()}));
+paintReviewed();
+})();
 """
