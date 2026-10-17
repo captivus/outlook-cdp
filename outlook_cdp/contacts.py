@@ -32,12 +32,39 @@ Six things about this that are not obvious:
 
 The notes field is ``PersonalNotes``, plain text; Outlook shows it under "Notes" on the contact card.
 Like the rest of the REST path, every call is scoped to ``/api/v2.0/users/<mailbox>/``.
+
+`Contact` is the shape for *writing*.  For keeping or comparing what is already there, use the raw
+records from `list_raw` / `backup`, because the REST contact leaves out much of an Outlook contact:
+
+7. **Half the phone slots are not on the REST contact.**  Other, fax, pager, car, callback, assistant,
+   company-main and primary numbers, the personal web page, the anniversary and the four user fields
+   exist only as MAPI properties.  `list_raw` asks for them (`EXTENDED_PROPERTIES`) as single-value
+   extended properties, so a card holding nothing but a fax number does not look empty.
+8. **Contacts live in more folders than the default one.**  ``/contacts`` is the default folder only;
+   `folders` walks ``/contactfolders`` and every ``childfolders`` below it, and a backup covers them all.
+9. **Contact groups are in the folder but not in ``/contacts``.**  A folder's ``$count`` includes its
+   distribution lists; the REST contact list silently leaves them out, so the two never agree.  `groups`
+   reads them through Outlook's own ``service.svc`` (FindItem, then GetItem), members and all, and a
+   backup checks that contacts plus groups add up to the server's count.
+10. **The REST contact is one view; Outlook's own is another.**  ``service.svc`` GetItem with
+    ``AllProperties`` returns the contact in Exchange's schema: phone numbers keyed by kind
+    (``BusinessFax``, ``Pager``...), addresses keyed Home/Business/Other, follow-up flags, sensitivity.
+    REST ids are not accepted there, but the ChangeKey is shared, so `ews_items` joins the two by it.
+    A backup holds both views, and the deduplication check needs both to agree that nothing is lost.
+11. **DELETE takes no precondition.**  An ``If-Match`` with a stale ChangeKey is ignored and the contact
+    deleted anyway, so "unchanged since I checked" can only be narrowed, never guaranteed, by re-reading
+    just before deleting.  What makes deleting tolerable is that it is soft: a deleted contact moves to
+    Deleted Items whole, every MAPI property included, until that folder is emptied.
 """
 from __future__ import annotations
 
 import base64
+import datetime
+import hashlib
 import json
+import os
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 
@@ -80,6 +107,72 @@ _PHOTO_JS = """(async()=>{try{
 
 _SELECT = ",".join(["Id", "HomePhones", "BusinessPhones", "EmailAddresses", "HomeAddress",
                     "OtherAddress", "Categories", "Birthday", *_SCALARS.values()])
+
+
+#: MAPI properties an Outlook contact can carry that the REST contact does not expose: name -> PropertyId.
+_ADDRESS_SET = "{00062004-0000-0000-C000-000000000046}"
+EXTENDED_PROPERTIES = {
+    "other_phone": "String 0x3A1F", "primary_phone": "String 0x3A1A", "company_main_phone": "String 0x3A57",
+    "business_fax": "String 0x3A24", "home_fax": "String 0x3A25", "other_fax": "String 0x3A23",
+    "pager": "String 0x3A21", "car_phone": "String 0x3A1E", "callback_phone": "String 0x3A02",
+    "radio_phone": "String 0x3A1D", "telex": "String 0x3A2C", "isdn": "String 0x3A2D",
+    "tty_tdd_phone": "String 0x3A4B", "assistant_phone": "String 0x3A2E",
+    "personal_home_page": "String 0x3A50", "hobbies": "String 0x3A43", "language": "String 0x3A0C",
+    "location": "String 0x3A0D", "account": "String 0x3A00", "customer_id": "String 0x3A4A",
+    "government_id": "String 0x3A07", "organizational_id": "String 0x3A10",
+    "referred_by": "String 0x3A47", "computer_network_name": "String 0x3A49", "ftp_site": "String 0x3A4C",
+    "anniversary": "SystemTime 0x3A41", "gender": "Short 0x3A4D",
+    "user_field_1": f"String {_ADDRESS_SET} Id 0x804F", "user_field_2": f"String {_ADDRESS_SET} Id 0x8050",
+    "user_field_3": f"String {_ADDRESS_SET} Id 0x8051", "user_field_4": f"String {_ADDRESS_SET} Id 0x8052",
+    "web_page": f"String {_ADDRESS_SET} Id 0x802B", "im_address": f"String {_ADDRESS_SET} Id 0x8062",
+}
+
+#: Which of those are phone numbers, so they are matched by digits like the REST slots.
+EXTENDED_PHONES = {"other_phone", "primary_phone", "company_main_phone", "business_fax", "home_fax",
+                   "other_fax", "pager", "car_phone", "callback_phone", "radio_phone", "telex", "isdn",
+                   "tty_tdd_phone", "assistant_phone"}
+
+#: Server-assigned properties a create must not send back.
+_READ_ONLY = {"Id", "ChangeKey", "CreatedDateTime", "LastModifiedDateTime", "ParentFolderId"}
+
+#: Items per service.svc GetItem call.
+_GETITEM_BATCH = 100
+
+#: Contacts per in-page call when fetching photos; each call runs its fetches one after another.
+_PHOTO_BATCH = 50
+
+#: Fetch each id's photo as base64, or the HTTP status when there is none (404).
+_PHOTOS_JS = """(async()=>{const out={};for(const id of %s){try{
+  const r=await fetch(%s+'/'+encodeURIComponent(id)+'/photo/$value',{headers:{authorization:'Bearer '+%s}});
+  if(r.status!==200){out[id]=r.status;continue}
+  const b=new Uint8Array(await r.arrayBuffer());let s='';
+  for(let i=0;i<b.length;i+=8192) s+=String.fromCharCode.apply(null,b.subarray(i,i+8192));
+  out[id]={type:r.headers.get('content-type'),b64:btoa(s)}}catch(e){out[id]=String(e)}}return out})()"""
+
+
+#: POST one request to Outlook's own JSON service; returns its response messages, or the error body.
+_OWA_JS = """(async()=>{const r=await fetch('/owa/service.svc?action='+%s+'&app=Mail',{method:'POST',
+  headers:{authorization:'Bearer '+%s,action:%s,'content-type':'application/json; charset=utf-8'},body:%s});
+  let d=null;try{d=await r.json()}catch(e){}
+  const m=d&&d.Body&&d.Body.ResponseMessages&&d.Body.ResponseMessages.Items;
+  return {status:r.status, messages:m||null, error:m?null:JSON.stringify(d).slice(0,400)}})()"""
+
+
+def _ext_expand() -> str:
+    flt = " or ".join(f"PropertyId eq '{pid}'" for pid in EXTENDED_PROPERTIES.values())
+    return "$expand=SingleValueExtendedProperties($filter=" + urllib.parse.quote(flt) + ")"
+
+
+def extended(raw: dict) -> dict:
+    """A raw record's non-empty extended properties, by `EXTENDED_PROPERTIES` name."""
+    by_id = {pid.lower(): name for name, pid in EXTENDED_PROPERTIES.items()}
+    out = {}
+    for p in raw.get("SingleValueExtendedProperties") or []:
+        name = by_id.get((p.get("PropertyId") or "").lower(), p.get("PropertyId"))
+        val = p.get("Value")
+        if val not in (None, "") and not (name == "gender" and str(val) == "0"):
+            out[name] = val
+    return out
 
 
 def phone_digits(number: str) -> str:
@@ -214,10 +307,14 @@ class Contacts:
                 "explicitly (Rules.signed_in_address(session) gives the signed-in user's address).")
         self.base = "/api/v2.0/users/" + urllib.parse.quote(self.mailbox, safe="") + "/contacts"
         self._token: str | None = None
+        self._token_at = 0.0
+        self.root = self.base.rsplit("/", 1)[0]
 
     def token(self) -> str:
-        if self._token is None:
-            self._token = access_token(self.s)
+        """The page's token, re-read every ten minutes so a long backup or apply outlives one token."""
+        at = getattr(self, "_token_at", 0.0)
+        if self._token is None or (at and time.time() - at > 600):
+            self._token, self._token_at = access_token(self.s), time.time()
         return self._token
 
     def list(self) -> list[Contact]:
@@ -325,5 +422,236 @@ class Contacts:
         return meta
 
     def delete(self, contact_id: str) -> None:
+        """Delete one contact.  It goes to Deleted Items whole; the server takes no ChangeKey precondition."""
         rest_send(self.s, "DELETE", f"{self.base}/{urllib.parse.quote(contact_id, safe='')}",
                   token=self.token())
+
+    # ------------------------------------------------------------------ whole records
+
+    def _folder_base(self, folder_id: str | None) -> str:
+        return self.base if not folder_id else \
+            f"{self.root}/contactfolders/{urllib.parse.quote(folder_id, safe='')}/contacts"
+
+    def folders(self) -> list[dict]:
+        """Every contact folder: the default one (id ``None``) first, then each folder below it, depth first."""
+        out = [{"id": None, "name": "Contacts", "parent": None}]
+
+        def walk(path: str, parent: str | None, prefix: str) -> None:
+            while path:
+                page = rest_get(self.s, path, self.token())
+                for f in page.get("value") or []:
+                    name = prefix + f.get("DisplayName", "")
+                    out.append({"id": f["Id"], "name": name, "parent": parent})
+                    walk(f"{self.root}/contactfolders/{urllib.parse.quote(f['Id'], safe='')}/childfolders"
+                         f"?$top=100", f["Id"], name + "/")
+                nxt = page.get("@odata.nextLink")
+                path = ("/" + nxt.split("/", 3)[3]) if nxt else None
+
+        walk(f"{self.root}/contactfolders?$top=100", None, "")
+        return out
+
+    def count(self, folder_id: str | None = None) -> int:
+        """How many contacts the server says `folder_id` holds, independently of paging through them."""
+        page = rest_get(self.s, f"{self._folder_base(folder_id)}?$top=1&$select=Id&$count=true", self.token())
+        return int(page["@odata.count"])
+
+    def list_raw(self, folder_id: str | None = None) -> list[dict]:
+        """Every contact in one folder as the server's whole record, with `EXTENDED_PROPERTIES` expanded."""
+        out: list[dict] = []
+        path: str | None = f"{self._folder_base(folder_id)}?$top=500&{_ext_expand()}"
+        while path:
+            page = rest_get(self.s, path, self.token())
+            out += [{k: v for k, v in r.items() if not k.startswith("@odata")} for r in page.get("value") or []]
+            nxt = page.get("@odata.nextLink")
+            path = ("/" + nxt.split("/", 3)[3]) if nxt else None
+        return out
+
+    def _owa(self, action: str, body: dict) -> list[dict]:
+        """One service.svc call; its response messages (one per item asked for), all checked NoError."""
+        req = {"__type": f"{action}JsonRequest:#Exchange",
+               "Header": {"__type": "JsonRequestHeaders:#Exchange", "RequestServerVersion": "V2018_01_08"},
+               "Body": {"__type": f"{action}Request:#Exchange", **body}}
+        out = self.s.js(_OWA_JS % (json.dumps(action), json.dumps(self.token()), json.dumps(action),
+                                   json.dumps(json.dumps(req))), await_promise=True) or {}
+        msgs = out.get("messages") or []
+        bad = [m.get("ResponseCode") for m in msgs if m.get("ResponseCode") != "NoError"]
+        if out.get("status") != 200 or not msgs or bad:
+            raise OutlookError(f"service.svc {action} returned {out.get('status')} {bad} "
+                               f"{out.get('error') or ''}"[:400])
+        return msgs
+
+    def _find_items(self, folder_id: str | None) -> list[dict]:
+        """Every item in one folder as ``{"ItemId": {"Id", "ChangeKey"}, "ItemClass"}``, through service.svc."""
+        parent = ({"__type": "DistinguishedFolderId:#Exchange", "Id": "contacts"} if not folder_id else
+                  {"__type": "FolderId:#Exchange", "Id": folder_id})
+        shape = {"__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+                 "AdditionalProperties": [{"__type": "PropertyUri:#Exchange", "FieldURI": "ItemClass"}]}
+        out, offset = [], 0
+        while True:
+            root = self._owa("FindItem", {"ItemShape": shape, "ParentFolderIds": [parent], "Traversal": "Shallow",
+                                          "Paging": {"__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning",
+                                                     "Offset": offset, "MaxEntriesReturned": 1000}})[0]["RootFolder"]
+            items = root.get("Items") or []
+            out += items
+            offset += len(items)
+            if root.get("IncludesLastItemInRange", True) or not items:
+                break
+        return out
+
+    def get_items(self, ews_ids: list[str]) -> list[dict]:
+        """Outlook's whole items (GetItem, ``AllProperties``) for service.svc ids, in order."""
+        out = []
+        for i in range(0, len(ews_ids), _GETITEM_BATCH):
+            got = self._owa("GetItem", {"ItemShape": {"__type": "ItemResponseShape:#Exchange",
+                                                      "BaseShape": "AllProperties"},
+                                        "ItemIds": [{"__type": "ItemId:#Exchange", "Id": x}
+                                                    for x in ews_ids[i:i + _GETITEM_BATCH]]})
+            out += [item for m in got for item in m.get("Items") or []]
+        return out
+
+    def groups(self, folder_id: str | None = None) -> list[dict]:
+        """The contact groups (distribution lists) in one folder, each as Outlook's whole item with Members."""
+        return self.get_items([i["ItemId"]["Id"] for i in self._find_items(folder_id)
+                               if (i.get("ItemClass") or "").startswith("IPM.DistList")])
+
+    def ews_items(self, folder_id: str | None = None, change_keys: set | None = None) -> dict[str, dict]:
+        """Outlook's own view of the contacts in one folder, keyed by ChangeKey - the one key REST shares.
+
+        With `change_keys`, only those contacts are fetched.
+        """
+        ids = [i["ItemId"]["Id"] for i in self._find_items(folder_id)
+               if (i.get("ItemClass") or "").startswith("IPM.Contact")
+               and (change_keys is None or i["ItemId"]["ChangeKey"] in change_keys)]
+        return {item["ItemId"]["ChangeKey"]: item for item in self.get_items(ids)}
+
+    def change_keys(self, folder_id: str | None = None) -> dict[str, str]:
+        """Each contact's id -> ChangeKey in one folder: cheap, for proving nothing changed meanwhile."""
+        out: dict[str, str] = {}
+        path: str | None = f"{self._folder_base(folder_id)}?$top=500&$select=Id,ChangeKey"
+        while path:
+            page = rest_get(self.s, path, self.token())
+            out.update({r["Id"]: r["ChangeKey"] for r in page.get("value") or []})
+            nxt = page.get("@odata.nextLink")
+            path = ("/" + nxt.split("/", 3)[3]) if nxt else None
+        return out
+
+    def get_raw(self, contact_id: str) -> dict | None:
+        """One whole record, or ``None`` when the server no longer has it."""
+        try:
+            r = rest_get(self.s, f"{self.base}/{urllib.parse.quote(contact_id, safe='')}?{_ext_expand()}",
+                         self.token())
+        except OutlookError as e:
+            if " 404 " in str(e) or "ErrorItemNotFound" in str(e):
+                return None
+            raise
+        return {k: v for k, v in r.items() if not k.startswith("@odata")}
+
+    def photos(self, contact_ids: list[str]) -> dict[str, dict | None]:
+        """Each contact's photo as ``{"type", "b64", "sha256"}``, or ``None`` for a contact without one."""
+        out: dict[str, dict | None] = {}
+        for i in range(0, len(contact_ids), _PHOTO_BATCH):
+            batch = contact_ids[i:i + _PHOTO_BATCH]
+            got = self.s.js(_PHOTOS_JS % (json.dumps(batch), json.dumps(self.base), json.dumps(self.token())),
+                            await_promise=True) or {}
+            for cid in batch:
+                v = got.get(cid)
+                if isinstance(v, dict):
+                    v["sha256"] = hashlib.sha256(base64.b64decode(v["b64"])).hexdigest()
+                    out[cid] = v
+                elif v == 404:
+                    out[cid] = None
+                else:
+                    raise OutlookError(f"photo fetch for one contact failed: {v!r}")
+        return out
+
+    def backup(self, directory: str) -> dict:
+        """Write every contact in every folder, with photos, to a timestamped JSON file, and prove it whole.
+
+        The proof: each folder's contacts plus its contact groups equal the server's own ``$count`` taken
+        before and after reading it; every contact's two views (REST and service.svc) are joined by
+        ChangeKey; once everything is read, every folder's contact and group ids and ChangeKeys are read again
+        and must be exactly those saved, so nothing was added, removed or edited meanwhile; every id is distinct; and
+        the file read back from disk parses to the same records.
+        Returns a summary with the file's path and SHA-256.
+        """
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        folders, records, groups = self.folders(), [], []
+        for f in folders:
+            before = self.count(f["id"])
+            raw = self.list_raw(f["id"])
+            grp = self.groups(f["id"])
+            after = self.count(f["id"])
+            if not before == after == len(raw) + len(grp):
+                raise OutlookError(f"folder {f['name']!r}: server counted {before} then {after}, read "
+                                   f"{len(raw)} contacts and {len(grp)} groups. The book changed or "
+                                   f"paging lost records; not saved.")
+            f["count"], f["groups"] = len(raw), len(grp)
+            groups += [{"folder": f["id"], "item": g} for g in grp]
+            pics = self.photos([r["Id"] for r in raw])
+            ews = self.ews_items(f["id"])
+            unjoined = [r["Id"] for r in raw if r["ChangeKey"] not in ews]
+            if unjoined or len(ews) != len(raw):
+                raise OutlookError(f"folder {f['name']!r}: {len(unjoined)} contacts have no service.svc view "
+                                   f"({len(ews)} views for {len(raw)} contacts); not saved.")
+            records += [{"folder": f["id"], "record": r, "photo": pics[r["Id"]], "ews": ews[r["ChangeKey"]]}
+                        for r in raw]
+        for f in folders:
+            saved = {e["record"]["Id"]: e["record"]["ChangeKey"] for e in records if e["folder"] == f["id"]}
+            saved_groups = {g["item"]["ItemId"]["Id"]: g["item"]["ItemId"]["ChangeKey"]
+                            for g in groups if g["folder"] == f["id"]}
+            now_groups = {i["ItemId"]["Id"]: i["ItemId"]["ChangeKey"] for i in self._find_items(f["id"])
+                          if (i.get("ItemClass") or "").startswith("IPM.DistList")}
+            if self.change_keys(f["id"]) != saved or now_groups != saved_groups:
+                raise OutlookError(f"folder {f['name']!r} changed while it was being read; not saved. "
+                                   f"Run the backup again.")
+        ids = [r["record"]["Id"] for r in records]
+        if len(set(ids)) != len(ids):
+            raise OutlookError("the same contact id was read twice; not saved")
+        doc = {"format": 1, "mailbox": self.mailbox, "taken_at": stamp, "folders": folders,
+               "extended_properties": EXTENDED_PROPERTIES, "contacts": records, "groups": groups}
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"contacts-backup-{stamp}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=1)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if json.loads(data) != doc:
+            raise OutlookError(f"{path} does not read back as what was written")
+        return {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "contacts": len(records),
+                "groups": len(groups), "photos": sum(1 for r in records if r["photo"]),
+                "folders": {f["name"]: {"contacts": f["count"], "groups": f["groups"]} for f in folders}}
+
+    def restore(self, entry: dict, folder_id: str | None = None) -> dict:
+        """Recreate one backed-up contact (an item of a backup's ``contacts``) and prove nothing was lost.
+
+        It goes back into its own folder unless `folder_id` is given.  The new contact gets a new id; it
+        is read back and must hold everything the backed-up one held in both views, or it is deleted again
+        and refused - as it is if anything fails after it was created.
+        """
+        from .dedupe import coverage_gaps   # dedupe imports this module
+        raw = entry["record"]
+        payload = {k: v for k, v in raw.items() if k not in _READ_ONLY and k != "SingleValueExtendedProperties"
+                   and v not in (None, "", [], {})}
+        ext = [p for p in raw.get("SingleValueExtendedProperties") or [] if p.get("Value") not in (None, "")]
+        if ext:
+            payload["SingleValueExtendedProperties"] = ext
+        made = rest_send(self.s, "POST", self._folder_base(folder_id or entry.get("folder")), payload,
+                         self.token())
+        if not made.get("Id"):
+            raise OutlookError(f"contact POST returned no Id: {json.dumps(made)[:300]}")
+        try:
+            if entry.get("photo"):
+                self.set_photo(made["Id"], base64.b64decode(entry["photo"]["b64"]), entry["photo"]["type"])
+            record = self.get_raw(made["Id"])
+            back = {"record": record, "photo": self.photos([made["Id"]])[made["Id"]],
+                    "ews": self.ews_items(folder_id or entry.get("folder"), {record["ChangeKey"]}).get(
+                        record["ChangeKey"])}
+            gaps = coverage_gaps(entry, back)
+        except Exception:
+            self.delete(made["Id"])
+            raise
+        if gaps:
+            self.delete(made["Id"])
+            raise OutlookError("the restored contact lacked some of the backup, so it was deleted again: "
+                               + "; ".join(gaps))
+        return back["record"]

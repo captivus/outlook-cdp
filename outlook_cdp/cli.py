@@ -13,6 +13,7 @@ from . import guards as G
 from .mail import Mailbox
 from .reading import Reader
 from .recipients import resolved_recipients
+from . import dedupe
 from .contacts import Contact, Contacts
 from .rules import Rule, Rules
 from .session import OutlookError, Session
@@ -98,8 +99,10 @@ def main(argv=None) -> int:
     r.add_argument("--mark-read", action="store_true")
     r.add_argument("--folder", default="inbox", help="folder that preview / apply look in")
 
-    k = sub.add_parser("contacts", help="list, find, add, update, photograph or delete contacts over REST")
-    k.add_argument("action", choices=["list", "find", "add", "update", "photo", "delete"])
+    k = sub.add_parser("contacts", help="list, find, add, update, photograph, delete, back up, restore or "
+                                        "deduplicate contacts over REST")
+    k.add_argument("action", choices=["list", "find", "add", "update", "photo", "delete", "backup", "restore",
+                                      "dedupe-plan", "dedupe-apply"])
     k.add_argument("--mailbox", default="", help="whose contacts; defaults to the tab URL's mailbox, and "
                                                 "'me' means the signed-in user")
     k.add_argument("--phone", default="", help="find: number to match, formatting ignored")
@@ -111,6 +114,17 @@ def main(argv=None) -> int:
                    help="add: create even when a number is already on another contact")
     k.add_argument("--id", default="", help="update, photo, delete: contact id")
     k.add_argument("--photo", default="", help="photo: a JPEG, PNG or GIF file to set as the picture")
+    k.add_argument("--out", default="", help="backup: directory for the backup file; dedupe-plan: plan file")
+    k.add_argument("--backup", default="", help="restore, dedupe-plan, dedupe-apply: a backup file")
+    k.add_argument("--plan", default="", help="dedupe-apply: the reviewed plan file")
+    k.add_argument("--same-folder", action="store_true",
+                   help="dedupe-plan: only treat contacts in the same folder as duplicates")
+    k.add_argument("--ignore-category", action="append", default=[], metavar="NAME",
+                   help="dedupe-plan: a category that is not information (repeatable)")
+    k.add_argument("--log", default="", help="dedupe-apply: JSON-lines log, appended to")
+    k.add_argument("--limit", type=int, default=0, help="dedupe-apply: stop after this many deletions")
+    k.add_argument("--delete", action="store_true",
+                   help="dedupe-apply: actually delete; without it, only report what would be deleted")
 
     a = p.parse_args(argv)
     s = Session(a.instance, host=a.host)
@@ -264,10 +278,49 @@ def rules_cmd(a, s: Session) -> int:
 
 
 def contacts_cmd(a, s: Session) -> int:
+    if a.action == "dedupe-plan":                           # offline: reads only the backup file
+        if not (a.backup and a.out):
+            print("dedupe-plan needs --backup and --out", file=sys.stderr)
+            return 2
+        plan = dedupe.plan(dedupe.load(a.backup), across_folders=not a.same_folder,
+                           ignore_categories=a.ignore_category)
+        dedupe.write_plan(plan, a.out)
+        print(json.dumps(plan["summary"], indent=1))
+        return 0
     mailbox = Rules.signed_in_address(s) if a.mailbox == "me" else (a.mailbox or None)
     show = lambda c: {k: v for k, v in vars(c).items() if v}   # noqa: E731
     try:
         book = Contacts(s, mailbox)
+        if a.action == "backup":
+            if not a.out:
+                print("backup needs --out DIRECTORY", file=sys.stderr)
+                return 2
+            print(json.dumps(book.backup(a.out), indent=1))
+            return 0
+        if a.action == "restore":
+            if not (a.backup and a.id):
+                print("restore needs --backup and --id (the contact's id in the backup)", file=sys.stderr)
+                return 2
+            entry = next((e for e in dedupe.load(a.backup)["contacts"] if e["record"]["Id"] == a.id), None)
+            if entry is None:
+                print(f"no contact with id {a.id} in that backup", file=sys.stderr)
+                return 2
+            made = book.restore(entry)
+            print(json.dumps({"restored": dedupe.display(entry), "new_id": made["Id"]}))
+            return 0
+        if a.action == "dedupe-apply":
+            if not (a.backup and a.plan and a.log):
+                print("dedupe-apply needs --backup, --plan and --log", file=sys.stderr)
+                return 2
+            plan, backup = dedupe.load(a.plan), dedupe.load(a.backup)
+            if not a.delete:
+                todo = dedupe.approved(plan)[:a.limit or None]
+                print(json.dumps({"would_delete": len(todo), "first": [
+                    {"delete": d["delete"]["name"], "keep": d["keep"]["name"]} for d in todo[:20]]}, indent=1))
+                print("Nothing deleted. Add --delete to carry out the plan.", file=sys.stderr)
+                return 0
+            print(json.dumps(dedupe.apply(book, plan, backup, a.log, limit=a.limit or None)))
+            return 0
         if a.action == "list":
             print(json.dumps([show(c) for c in book.list()], indent=1))
             return 0
