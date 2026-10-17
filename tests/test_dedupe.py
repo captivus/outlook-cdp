@@ -455,6 +455,19 @@ def test_review_page_carries_decision_controls_except_for_group_members():
     assert page.count("class='decide'") == 2 and "Download decisions" in page and "class='gdata'" in page
 
 
+def test_review_page_scripts_parse():
+    import re
+    import shutil
+    import subprocess
+    from outlook_cdp import dedupe_review
+    if not shutil.which("node"):
+        return
+    a, b, backup, plan = _differing_pair()
+    page = dedupe_review.render(backup, plan)
+    for script in re.findall(r"<script>(.*?)</script>", page, re.S):
+        subprocess.run(["node", "--check", "-"], input=script.encode(), check=True)
+
+
 def test_apply_refuses_another_mailbox():
     a, b = (_entry(MobilePhone1="5555550100") for _ in range(2))
     backup = _backup(a, b)

@@ -65,8 +65,8 @@ def _rows(entry: dict, ignore=()) -> list[tuple[str, str, str]]:
         if not _s(a):
             continue
         emails.append(a + (f"  ({n})" if _s(n) and _s(n).lower() != _s(a).lower() else ""))
-    for i, e in enumerate(sorted(emails), 1):
-        add("Email", f"Email {i}", e)
+    for e in sorted(emails, key=str.lower):
+        add("Email", "email:" + e.split()[0].lower(), e)       # one row per address, shared where shared
     for p in x.get("PhoneNumbers") or []:
         add("Phone", _PHONE_LABELS.get(p.get("Key"), p.get("Key") or "Phone"), p.get("PhoneNumber"))
     if not x:                                          # no second view: fall back to the REST slots
@@ -102,6 +102,32 @@ def _rows(entry: dict, ignore=()) -> list[tuple[str, str, str]]:
     return out
 
 
+def _cells(entry: dict, ignore) -> dict:
+    return {(sec, label): v for sec, label, v in _rows(entry, ignore)}
+
+
+def _say(key: tuple[str, str], value: str, other: str = "") -> str:
+    sec, label = key
+    value = value if len(value) <= 160 else value[:160] + "…"
+    if sec == "Email":
+        return f"Email address {value}"
+    text = f"{label}: {value}"
+    return text + (f"  (the other has: {other[:80]})" if other else "")
+
+
+def _plain(a: dict, b: dict, ignore) -> list[str]:
+    """In plain words, the table values `a` shows that `b` does not."""
+    ca, cb = _cells(a, ignore), _cells(b, ignore)
+    return [_say(k, v, cb.get(k, "")) for k, v in ca.items() if _s(v).lower() != _s(cb.get(k)).lower()]
+
+
+def _only(entry: dict, others: list[dict], ignore) -> list[str]:
+    """In plain words, the table values on `entry` that no other contact in the group shows."""
+    mine, theirs = _cells(entry, ignore), [_cells(o, ignore) for o in others]
+    return [_say(k, v) for k, v in mine.items()
+            if all(_s(v).lower() != _s(t.get(k)).lower() for t in theirs)]
+
+
 def _gaps(a: dict, b: dict, ignore) -> list[str]:
     """What `a` holds that `b` lacks, for reading: the REST view's report, which names fields plainly, or
     the service.svc view's when REST finds nothing - the two mostly report the same difference twice."""
@@ -123,7 +149,9 @@ def _decision_data(entries: list[dict], ignore, planned: dict) -> str:
     for i, a in enumerate(entries):
         for j, b in enumerate(entries):
             if i != j:
-                loss[f"{i}>{j}"] = {"show": _gaps(a, b, ignore), "full": coverage_gaps(a, b, ignore)}
+                full = coverage_gaps(a, b, ignore)
+                loss[f"{i}>{j}"] = {"show": _plain(a, b, ignore) if full else [], "tech": _gaps(a, b, ignore),
+                                    "full": full}
     ids = [e["record"]["Id"] for e in entries]
     data = {"ids": ids, "names": [display(e) for e in entries], "loss": loss,
             "planned": {ids.index(d): ids.index(k) for d, k in planned.items() if d in ids and k in ids}}
@@ -163,19 +191,19 @@ def _table(entries: list[dict], folders: dict, ignore, note: str = "", decide: b
                 cls = "none"
             text = html.escape(v) if _s(v) else "—"
             cells.append(f"<td class='{cls}'>{'<div class=notes>' + text + '</div>' if sec == 'Notes' else text}</td>")
-        body.append(f"<tr><th scope='row'>{html.escape(label)}</th>{''.join(cells)}</tr>")
-    first = entries[0]
+        shown = "Email" if label.startswith("email:") else label
+        body.append(f"<tr><th scope='row'>{html.escape(shown)}</th>{''.join(cells)}</tr>")
     holds = []
     for i, e in enumerate(entries):
-        if i == 0:
-            gaps = sorted({g for other in entries[1:] for g in _gaps(first, other, ignore)})
-            title = f"{html.escape(display(e))} (first column) has, that some other column lacks"
-        else:
-            gaps = _gaps(e, first, ignore)
-            title = f"Column {i + 1} has, that the first column lacks"
-        items = "".join(f"<li>{html.escape(g)}</li>" for g in gaps[:40]) or "<li class='nothing'>nothing</li>"
-        more = f"<li class='nothing'>…and {len(gaps) - 40} more</li>" if len(gaps) > 40 else ""
-        holds.append(f"<div class='holds'><h4>{title}</h4><ul>{items}{more}</ul></div>")
+        others = entries[:i] + entries[i + 1:]
+        only = _only(e, others, ignore)
+        items = "".join(f"<li>{html.escape(x)}</li>" for x in only) or \
+            "<li class='nothing'>nothing the table shows</li>"
+        raw = sorted({g for o in others for g in _gaps(e, o, ignore)})
+        report = (f"<details class='raw'><summary>Checker's full report ({len(raw)})</summary><ul>"
+                  + "".join(f"<li>{html.escape(g)}</li>" for g in raw) + "</ul></details>") if raw else ""
+        holds.append(f"<div class='holds'><h4>Only on column {i + 1}: {html.escape(display(e))}</h4>"
+                     f"<ul>{items}</ul>{report}</div>")
     decision = _decide_row(entries) if decide else ""
     return (f"{note}<div class='scroll'><table><thead><tr><th class='corner'></th>{head}</tr>{decision}</thead>"
             f"<tbody>{''.join(body)}</tbody></table></div><div class='holdsgrid'>{''.join(holds)}</div>")
@@ -285,6 +313,8 @@ td.none{{background:var(--none);color:var(--muted)}}
 .holds h4{{margin:4px 0;font-size:12px;color:var(--muted);font-weight:600}}
 .holds ul{{margin:0;padding-left:18px;font-size:13px}} .holds li{{overflow-wrap:anywhere}} .nothing{{color:var(--muted);list-style:none;margin-left:-18px}}
 .why{{margin:10px 14px 0;color:var(--muted);font-size:13px}}
+details.raw{{margin-top:4px;font-size:12px;color:var(--muted)}} details.raw summary{{cursor:pointer}}
+details.raw ul{{margin:4px 0;padding-left:16px}}
 tr.decrow th,tr.decrow td{{background:var(--sec);border-bottom:2px solid var(--line);font-size:13px}}
 td.decide label{{display:block;cursor:pointer}} td.decide select{{font:inherit;max-width:100%;margin-top:4px;
 background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px}}
@@ -365,7 +395,10 @@ function render(g){{
     const L=g.data.loss[c+'>'+v.keep];
     if(!L.full.length){{box.innerHTML='<span class="ok">Nothing is lost: that contact holds everything in this one.</span>';
       acc.hidden=true;v.acc=false}}
-    else{{box.innerHTML='<span class="warn">Would be lost:</span><ul>'+L.show.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+    else{{box.innerHTML='<span class="warn">This contact has, and the one you keep doesn’t:</span><ul>'+
+      (L.show.length?L.show.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>only details the table does not show</li>')+'</ul>'+
+      '<details class="raw"><summary>Checker’s full report ('+L.tech.length+')</summary><ul>'+
+      L.tech.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></details>';
       acc.hidden=false;td.querySelector('.d-acc').checked=!!v.acc}}
     const need=L.full.length&&!v.acc; td.classList.toggle('bad',!!need); if(need) bad++;
   }});
