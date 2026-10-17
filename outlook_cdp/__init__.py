@@ -41,6 +41,7 @@ from .text import to_html, normalise                               # noqa: F401
 from .attachments import (Attachment, access_token, list_attachments,      # noqa: F401
                           messages_with_attachments, open_message_attachments,
                           open_conversation_messages, download, download_all, verify_file)
+from .rules import Rule, Rules, rest_send                          # noqa: F401
 from . import guards                                               # noqa: F401
 
 __all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards",
@@ -52,5 +53,5 @@ __all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards",
            "pierce_find", "box_center", "center_of", "to_html", "normalise",
            "Attachment", "access_token", "list_attachments", "messages_with_attachments",
            "open_message_attachments", "open_conversation_messages", "download",
-           "download_all", "verify_file"]
+           "download_all", "verify_file", "Rule", "Rules", "rest_send"]
 __version__ = "0.1.0"
