@@ -161,7 +161,9 @@ before anything is touched:
 outlook-cdp --instance my-instance contacts backup --mailbox me --out backups/
 outlook-cdp --instance my-instance contacts dedupe-plan --backup backups/contacts-backup-<stamp>.json \
     --out plan.json --ignore-category "Some marker category"      # offline; --same-folder to stay in folders
-# read plan.json; set "approved": true on any name-only match you want gone
+outlook-cdp --instance my-instance contacts dedupe-review --backup backups/... --plan plan.json \
+    --out review.html                       # offline: side-by-side tables of what each copy alone holds
+# read plan.json (and review.html); set "approved": true on any name-only match you want gone
 outlook-cdp --instance my-instance contacts dedupe-apply --mailbox me --backup backups/... --plan plan.json \
     --log apply-log.jsonl                                        # dry run: lists what it would delete
 outlook-cdp --instance my-instance contacts dedupe-apply ... --delete [--limit 10]
@@ -451,6 +453,7 @@ verified draft left open for a human to look at.
 | `outlook_cdp/rules.py` | inbox rules: list, preview, create with read-back verification, apply, delete |
 | `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete, every folder, groups, verified backup and restore |
 | `outlook_cdp/dedupe.py` | duplicate contacts: the no-information-lost check, planning from a backup, and a re-verified apply |
+| `outlook_cdp/dedupe_review.py` | a self-contained side-by-side HTML page of what a plan leaves for a person to decide |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |
 | `outlook_cdp/text.py` | plain text to Outlook HTML, and whitespace-normalised comparison |
 | `outlook_cdp/cli.py` | the command line |
@@ -464,7 +467,7 @@ python3 tests/test_text.py && python3 tests/test_guards.py && \
     python3 tests/test_contacts.py && python3 tests/test_dedupe.py
 ```
 
-144 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+145 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.

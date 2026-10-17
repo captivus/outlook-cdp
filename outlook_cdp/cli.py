@@ -13,7 +13,7 @@ from . import guards as G
 from .mail import Mailbox
 from .reading import Reader
 from .recipients import resolved_recipients
-from . import dedupe
+from . import dedupe, dedupe_review
 from .contacts import Contact, Contacts
 from .rules import Rule, Rules
 from .session import OutlookError, Session
@@ -102,7 +102,7 @@ def main(argv=None) -> int:
     k = sub.add_parser("contacts", help="list, find, add, update, photograph, delete, back up, restore or "
                                         "deduplicate contacts over REST")
     k.add_argument("action", choices=["list", "find", "add", "update", "photo", "delete", "backup", "restore",
-                                      "dedupe-plan", "dedupe-apply"])
+                                      "dedupe-plan", "dedupe-review", "dedupe-apply"])
     k.add_argument("--mailbox", default="", help="whose contacts; defaults to the tab URL's mailbox, and "
                                                 "'me' means the signed-in user")
     k.add_argument("--phone", default="", help="find: number to match, formatting ignored")
@@ -114,9 +114,10 @@ def main(argv=None) -> int:
                    help="add: create even when a number is already on another contact")
     k.add_argument("--id", default="", help="update, photo, delete: contact id")
     k.add_argument("--photo", default="", help="photo: a JPEG, PNG or GIF file to set as the picture")
-    k.add_argument("--out", default="", help="backup: directory for the backup file; dedupe-plan: plan file")
+    k.add_argument("--out", default="", help="backup: directory for the backup file; dedupe-plan: plan file; "
+                                         "dedupe-review: HTML file")
     k.add_argument("--backup", default="", help="restore, dedupe-plan, dedupe-apply: a backup file")
-    k.add_argument("--plan", default="", help="dedupe-apply: the reviewed plan file")
+    k.add_argument("--plan", default="", help="dedupe-review, dedupe-apply: the plan file")
     k.add_argument("--same-folder", action="store_true",
                    help="dedupe-plan: only treat contacts in the same folder as duplicates")
     k.add_argument("--ignore-category", action="append", default=[], metavar="NAME",
@@ -286,6 +287,14 @@ def contacts_cmd(a, s: Session) -> int:
                            ignore_categories=a.ignore_category)
         dedupe.write_plan(plan, a.out)
         print(json.dumps(plan["summary"], indent=1))
+        return 0
+    if a.action == "dedupe-review":                         # offline too: a page to open from disk
+        if not (a.backup and a.plan and a.out):
+            print("dedupe-review needs --backup, --plan and --out", file=sys.stderr)
+            return 2
+        with open(a.out, "w", encoding="utf-8") as fh:
+            fh.write(dedupe_review.render(dedupe.load(a.backup), dedupe.load(a.plan)))
+        print(json.dumps({"review": a.out}))
         return 0
     mailbox = Rules.signed_in_address(s) if a.mailbox == "me" else (a.mailbox or None)
     show = lambda c: {k: v for k, v in vars(c).items() if v}   # noqa: E731
