@@ -13,6 +13,7 @@ from . import guards as G
 from .mail import Mailbox
 from .reading import Reader
 from .recipients import resolved_recipients
+from .contacts import Contact, Contacts
 from .rules import Rule, Rules
 from .session import OutlookError, Session
 
@@ -97,10 +98,26 @@ def main(argv=None) -> int:
     r.add_argument("--mark-read", action="store_true")
     r.add_argument("--folder", default="inbox", help="folder that preview / apply look in")
 
+    k = sub.add_parser("contacts", help="list, find, add, update, photograph or delete contacts over REST")
+    k.add_argument("action", choices=["list", "find", "add", "update", "photo", "delete"])
+    k.add_argument("--mailbox", default="", help="whose contacts; defaults to the tab URL's mailbox, and "
+                                                "'me' means the signed-in user")
+    k.add_argument("--phone", default="", help="find: number to match, formatting ignored")
+    k.add_argument("--name", default="", help="find: display-name substring")
+    k.add_argument("--json", dest="json_file", default="",
+                   help="add: one Contact's fields as a JSON object, or a list of them; "
+                        "update: the fields to change, \"\" to clear")
+    k.add_argument("--allow-duplicate-phone", action="store_true",
+                   help="add: create even when a number is already on another contact")
+    k.add_argument("--id", default="", help="update, photo, delete: contact id")
+    k.add_argument("--photo", default="", help="photo: a JPEG, PNG or GIF file to set as the picture")
+
     a = p.parse_args(argv)
     s = Session(a.instance, host=a.host)
     if a.cmd == "rules":
         return rules_cmd(a, s)
+    if a.cmd == "contacts":
+        return contacts_cmd(a, s)
     if a.cmd == "search":
         return search_cmd(a, s)
     m = Mailbox(s)
@@ -244,6 +261,64 @@ def rules_cmd(a, s: Session) -> int:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3
     return 2
+
+
+def contacts_cmd(a, s: Session) -> int:
+    mailbox = Rules.signed_in_address(s) if a.mailbox == "me" else (a.mailbox or None)
+    show = lambda c: {k: v for k, v in vars(c).items() if v}   # noqa: E731
+    try:
+        book = Contacts(s, mailbox)
+        if a.action == "list":
+            print(json.dumps([show(c) for c in book.list()], indent=1))
+            return 0
+        if a.action == "find":
+            if not (a.phone or a.name):
+                print("find needs --phone or --name", file=sys.stderr)
+                return 2
+            everyone = book.list()
+            hits = book.find_by_phone(a.phone, everyone) if a.phone else book.find_by_name(a.name, everyone)
+            print(json.dumps([show(c) for c in hits], indent=1))
+            return 0
+        if a.action == "delete":
+            if not a.id:
+                print("delete needs --id", file=sys.stderr)
+                return 2
+            book.delete(a.id)
+            print(json.dumps({"deleted": a.id}))
+            return 0
+        if a.action == "photo":
+            if not (a.id and a.photo):
+                print("photo needs --id and --photo", file=sys.stderr)
+                return 2
+            kind = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif"}
+            ct = kind.get(a.photo.rsplit(".", 1)[-1].lower(), "")
+            print(json.dumps(book.set_photo(a.id, open(a.photo, "rb").read(), ct)))
+            return 0
+        if not a.json_file:
+            print(f"{a.action} needs --json", file=sys.stderr)
+            return 2
+        if a.action == "update":
+            if not a.id:
+                print("update needs --id", file=sys.stderr)
+                return 2
+            changes = json.load(open(a.json_file, encoding="utf-8"))
+            print(json.dumps(show(book.update(a.id, **changes)), indent=1))
+            return 0
+        raw = json.load(open(a.json_file, encoding="utf-8"))
+        made, failed = [], 0
+        for fields in raw if isinstance(raw, list) else [raw]:
+            try:
+                c = book.create(Contact(**fields), allow_duplicate_phone=a.allow_duplicate_phone)
+                made.append({"created": c.name(), "id": c.id})
+            except (OutlookError, TypeError) as e:
+                failed += 1
+                made.append({"refused": Contact(**fields).name() if isinstance(e, OutlookError) else
+                             str(fields)[:80], "why": str(e)})
+        print(json.dumps(made, indent=1))
+        return 3 if failed else 0
+    except OutlookError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

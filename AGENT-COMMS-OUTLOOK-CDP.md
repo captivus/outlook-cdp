@@ -360,3 +360,39 @@ flags now loads the stored rule, so what is applied is exactly what is live, not
 Also added `Reader(session, mailbox=...)` for tabs whose URL names no mailbox (previously callers had to
 set a private attribute), and an `outlook-cdp search` command: `$search` text, or `--from` for an exact
 sender with no `$search` cap, plus `--summary` to count by sender/subject/folder.
+
+---
+
+## 2026-10-17 14:30 CDT — Claude — Contacts over REST (`contacts.py`)
+
+New module `outlook_cdp/contacts.py`: `Contact`, `Contacts` (`list`, `get`, `find_by_phone`,
+`find_by_name`, `create`, `delete`) and `phone_digits`. `create` refuses a number already on another
+contact, POSTs, reads the contact back, compares every field it sent, and deletes it again on any
+difference. CLI gained `contacts list|find|add|delete`; `add --json` takes one object or a list.
+
+Verified against one real mailbox: a batch of contacts was created with names, a mobile and up to two
+home numbers, a home address and multi-line notes, and every one passed read-back (notes come back
+intact; whitespace is normalised in the comparison in case of CRLF). README behaviours 46–48.
+9 offline tests in `tests/test_contacts.py`, 103 across the suite. No other module's behaviour changed.
+
+---
+
+## 2026-10-17 15:20 CDT — Claude — Addendum: `Contacts.update` and `Contacts.set_photo`
+
+`update(contact_id, **changes)` PATCHes the named fields, sends explicit nulls for fields passed as
+`""`/`[]`, reads back and refuses on any difference. `set_photo` moves the image into the page in base64
+slices (one CDP argument is capped at 128 KiB) and verifies via `/photo` metadata. CLI gained
+`contacts update --id --json` and `contacts photo --id --photo`. Both were verified against one real
+mailbox: a batch of updates that cleared nicknames and a middle name read back clean, and PNG (150 px)
+and JPEG (512 px) photos were stored and reported their dimensions. README behaviours 49–50.
+
+---
+
+## 2026-10-17 15:45 CDT — Claude — Addendum: display names, update tests, docs
+
+Found while clearing middle initials on real contacts: the stored `DisplayName` is not re-derived when
+its parts change, so `update(middle_name="")` alone leaves the old initial in the display name; pass
+`display_name` too. Documented in `update`'s docstring and README behaviour 50. Two offline tests now
+cover `update` (explicit nulls sent for cleared fields; refusal when the server keeps a cleared field),
+11 in `tests/test_contacts.py`, 105 across the suite. Module docstring and README example cover
+`update` and `set_photo`; example phone numbers are 555 placeholders.

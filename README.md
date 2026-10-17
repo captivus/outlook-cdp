@@ -129,6 +129,29 @@ outlook-cdp --instance my-instance search "some phrase" --mailbox me --top 50
 outlook-cdp --instance my-instance search --from ci@example.com --folder archive --top 1000 --summary
 ```
 
+Contacts are REST as well — created, read back and checked, without the People UI:
+
+```python
+from outlook_cdp import Session, Contacts, Contact
+
+book = Contacts(Session("my-chrome-agent-instance"), mailbox="me@example.com")
+print([c.name() for c in book.find_by_phone("(555) 555-0100")])   # digits compared, formatting ignored
+book.create(Contact(given_name="Pat", surname="Example", mobile_phone="+1 (555) 555-0100",
+                    home_address={"street": "1 Main St", "city": "Springfield", "state": "IL"},
+                    personal_notes="Met at the club."))   # refuses a number already on a contact
+
+pat = book.find_by_phone("5555550100")[0]
+book.update(pat.id, nickname="", middle_name="")       # "" clears the field; read back and checked
+book.set_photo(pat.id, open("face.jpg", "rb").read())  # verified by reading the stored photo's size
+```
+
+```
+outlook-cdp --instance my-instance contacts find --mailbox me --phone 5555550100
+outlook-cdp --instance my-instance contacts add --mailbox me --json people.json   # one object or a list
+outlook-cdp --instance my-instance contacts update --mailbox me --id ID --json changes.json  # "" clears
+outlook-cdp --instance my-instance contacts photo --mailbox me --id ID --photo face.jpg
+```
+
 `Reader(session, mailbox=...)` takes the mailbox explicitly for a tab whose URL names none.
 
 `Reader` also has a `*_dom` method for each of those, which drives the UI instead. They exist for a page
@@ -336,6 +359,23 @@ quietly wrong rather than loudly broken.
     `mailbox_identity()` returns `None` and every REST helper refuses. For the signed-in user's own
     mailbox, `/api/v2.0/me`'s `EmailAddress` is the address to pass — never a silent fallback, because
     on a shared mailbox `me` is someone else.
+46. **The cached REST token can write contacts.** It carries `Contacts.ReadWrite`, so `/contacts` takes a
+    POST from inside the page with no consent prompt.
+47. **A contact's phone and email slots are fixed and small**: one mobile, two home, two business numbers
+    and three email addresses. `Contact.to_rest` refuses more than fit rather than trusting the server
+    to say what it dropped; overflow belongs in `personal_notes`, which is the card's "Notes".
+48. **Phone numbers are free text.** One contact book held the same number as `+1 (555) …`, `555.…` and
+    with a non-breaking space inside it. Matching compares the last ten digits, and
+    `Contacts.create` refuses a number already on another contact so a re-run does not duplicate people.
+49. **A contact photo cannot go into the page in one call.** chrome-agent passes each CDP call on its
+    command line, and Linux caps one argument at 128 KiB, so even a modest JPEG as base64 fails before
+    it reaches Chrome. `Contacts.set_photo` parks 60 KB base64 slices on a page global, PUTs
+    `/photo/$value` as raw bytes, and then reads `/photo` back for a width, because a 2xx on its own
+    does not prove a picture was stored.
+50. **An empty field in a PATCH is left alone, not cleared.** Clearing a nickname or middle name needs
+    an explicit `null` (an empty list for phones), which `Contacts.update` sends for any field passed as
+    `""` or `[]`, and then checks that the field really came back empty. The stored display name is not
+    re-derived when its parts change, so dropping a middle initial means passing `display_name` too.
 
 ## Design rules
 
@@ -368,6 +408,7 @@ verified draft left open for a human to look at.
 | `outlook_cdp/attachments.py` | enumerating and downloading attachments, read-only, without the attachment UI |
 | `outlook_cdp/reading.py` | folder listings, message bodies and search — over REST, with a DOM fallback |
 | `outlook_cdp/rules.py` | inbox rules: list, preview, create with read-back verification, apply, delete |
+| `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |
 | `outlook_cdp/text.py` | plain text to Outlook HTML, and whitespace-normalised comparison |
 | `outlook_cdp/cli.py` | the command line |
@@ -377,10 +418,11 @@ verified draft left open for a human to look at.
 
 ```
 python3 tests/test_text.py && python3 tests/test_guards.py && \
-    python3 tests/test_attachments.py && python3 tests/test_reading.py && python3 tests/test_rules.py
+    python3 tests/test_attachments.py && python3 tests/test_reading.py && python3 tests/test_rules.py && \
+    python3 tests/test_contacts.py
 ```
 
-94 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+105 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.
