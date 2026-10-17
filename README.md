@@ -152,6 +152,27 @@ outlook-cdp --instance my-instance contacts update --mailbox me --id ID --json c
 outlook-cdp --instance my-instance contacts photo --mailbox me --id ID --photo face.jpg
 ```
 
+Backing up and deduplicating a contact book is the same library, never ad hoc. Nothing merges: a duplicate
+is deleted only when another contact already holds every piece of information it has, judged through two
+independent views of each contact, and the plan is made offline from a verified backup so it can be read
+before anything is touched:
+
+```
+outlook-cdp --instance my-instance contacts backup --mailbox me --out backups/
+outlook-cdp --instance my-instance contacts dedupe-plan --backup backups/contacts-backup-<stamp>.json \
+    --out plan.json --ignore-category "Some marker category"      # offline; --same-folder to stay in folders
+# read plan.json; set "approved": true on any name-only match you want gone
+outlook-cdp --instance my-instance contacts dedupe-apply --mailbox me --backup backups/... --plan plan.json \
+    --log apply-log.jsonl                                        # dry run: lists what it would delete
+outlook-cdp --instance my-instance contacts dedupe-apply ... --delete [--limit 10]
+outlook-cdp --instance my-instance contacts restore --mailbox me --backup backups/... --id ID-IN-BACKUP
+```
+
+`outlook_cdp/dedupe.py` documents exactly what counts as "already held" (case counts in names, numbers must
+be in the same kind of slot, an extension is part of the number, a ZIP is held only by itself or its
+ZIP+4, unknown properties are never held) and what `apply` re-checks against the live book before each
+deletion.
+
 `Reader(session, mailbox=...)` takes the mailbox explicitly for a tab whose URL names none.
 
 `Reader` also has a `*_dom` method for each of those, which drives the UI instead. They exist for a page
@@ -376,6 +397,26 @@ quietly wrong rather than loudly broken.
     an explicit `null` (an empty list for phones), which `Contacts.update` sends for any field passed as
     `""` or `[]`, and then checks that the field really came back empty. The stored display name is not
     re-derived when its parts change, so dropping a middle initial means passing `display_name` too.
+51. **The REST contact leaves out half an Outlook contact.** Other, fax, pager, car, callback, assistant
+    and company-main numbers, the personal web page, the anniversary and the four user fields are MAPI
+    properties only. `Contacts.list_raw` expands them as single-value extended properties, so a card
+    holding nothing but a fax number does not look empty to a duplicate check.
+52. **`/contacts` is one folder, and not all of it.** It is the default folder only, and it silently omits
+    contact groups (distribution lists) that the folder's `$count` includes, so the two never agree.
+    `Contacts.folders` walks every `contactfolders`/`childfolders`, and `Contacts.groups` reads groups,
+    members and all, through Outlook's own `service.svc` (FindItem, then GetItem).
+53. **Outlook's own view of a contact is a second, independent one.** `service.svc` GetItem with
+    `AllProperties` keys numbers and addresses by kind and carries flags, sensitivity and the title. REST
+    ids are not accepted there, but the ChangeKey is shared, so `Contacts.ews_items` joins the two by it.
+54. **A paged listing is not a snapshot.** Equal counts before and after reading can hide one contact
+    removed and another added. `Contacts.backup` re-reads every folder's contact and group ids and
+    ChangeKeys after everything else and refuses on any difference.
+55. **DELETE ignores `If-Match`.** A stale ChangeKey is accepted and the contact deleted, so "unchanged
+    since I checked" can only be narrowed by re-reading just before deleting. Deleting is soft, though:
+    the contact moves to Deleted Items whole, every MAPI property included.
+56. **A group may link to the very contact being deleted.** Group members carry the contact's address and
+    an id in a form REST does not use, so a contact whose address is in any group is never deleted by
+    `dedupe.apply`, judged on the groups as they are at that moment.
 
 ## Design rules
 
@@ -408,7 +449,8 @@ verified draft left open for a human to look at.
 | `outlook_cdp/attachments.py` | enumerating and downloading attachments, read-only, without the attachment UI |
 | `outlook_cdp/reading.py` | folder listings, message bodies and search — over REST, with a DOM fallback |
 | `outlook_cdp/rules.py` | inbox rules: list, preview, create with read-back verification, apply, delete |
-| `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete |
+| `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete, every folder, groups, verified backup and restore |
+| `outlook_cdp/dedupe.py` | duplicate contacts: the no-information-lost check, planning from a backup, and a re-verified apply |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |
 | `outlook_cdp/text.py` | plain text to Outlook HTML, and whitespace-normalised comparison |
 | `outlook_cdp/cli.py` | the command line |
@@ -419,10 +461,10 @@ verified draft left open for a human to look at.
 ```
 python3 tests/test_text.py && python3 tests/test_guards.py && \
     python3 tests/test_attachments.py && python3 tests/test_reading.py && python3 tests/test_rules.py && \
-    python3 tests/test_contacts.py
+    python3 tests/test_contacts.py && python3 tests/test_dedupe.py
 ```
 
-105 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+144 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.

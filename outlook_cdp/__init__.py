@@ -43,9 +43,9 @@ from .attachments import (Attachment, access_token, list_attachments,      # noq
                           open_conversation_messages, download, download_all, verify_file)
 from .rules import Rule, Rules, rest_send                          # noqa: F401
 from .contacts import Contact, Contacts, phone_digits              # noqa: F401
-from . import guards                                               # noqa: F401
+from . import guards, dedupe                                       # noqa: F401
 
-__all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards",
+__all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards", "dedupe",
            "Reader", "Row", "Message", "Conversation",
            "parse_row_flags", "parse_count_badge", "parse_container_count",
            "split_sender", "on_behalf_of", "parse_recipients", "strip_glyphs",
@@ -56,4 +56,4 @@ __all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards",
            "open_message_attachments", "open_conversation_messages", "download",
            "download_all", "verify_file", "Rule", "Rules", "rest_send",
            "Contact", "Contacts", "phone_digits"]
-__version__ = "0.1.0"
+__version__ = "0.3.0"
