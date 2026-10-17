@@ -389,6 +389,72 @@ def test_apply_protects_a_contact_added_to_a_group_after_the_backup():
     assert book.deleted == []
 
 
+def _differing_pair():
+    a = _entry(MobilePhone1="5555550100", JobTitle="Engineer", ews={"JobTitle": "Engineer"})
+    b = _entry(MobilePhone1="5555550100", CompanyName="Acme", ews={"CompanyName": "Acme"})
+    backup = _backup(a, b)
+    plan = dedupe.plan(backup)
+    assert plan["delete"] == [] and len(plan["kept_with_differences"]) == 1
+    return a, b, backup, plan
+
+
+def _decision(backup, dup, keep, accepted):
+    return {"backup_taken_at": backup["taken_at"], "mailbox": backup["mailbox"],
+            "decisions": [{"delete": dup["record"]["Id"], "keep": keep["record"]["Id"], "accepted_loss": accepted}]}
+
+
+def test_a_decision_deletes_with_exactly_the_loss_it_accepted():
+    a, b, backup, plan = _differing_pair()
+    loss = dedupe.coverage_gaps(a, b)
+    assert loss
+    book = _FakeBook(backup)
+    with tempfile.NamedTemporaryFile("r", suffix=".jsonl") as log:
+        tally = dedupe.apply(book, plan, backup, log.name, decisions=_decision(backup, a, b, loss))
+    assert tally["deleted"] == 1 and book.deleted == [a["record"]["Id"]]
+
+
+def test_a_decision_accepting_less_than_it_loses_is_refused():
+    a, b, backup, plan = _differing_pair()
+    loss = dedupe.coverage_gaps(a, b)
+    try:
+        dedupe.checked_decisions(plan, backup, _decision(backup, a, b, loss[:-1]))
+    except OutlookError as e:
+        assert "different loss" in str(e)
+    else:
+        raise AssertionError("expected OutlookError")
+
+
+def test_a_decision_across_review_groups_is_refused():
+    a, b, backup, plan = _differing_pair()
+    stranger = _entry(GivenName="Lee", DisplayName="Lee Other", MobilePhone1="5555550199")
+    backup["contacts"].append(stranger)
+    plan = dedupe.plan(backup)
+    try:
+        dedupe.checked_decisions(plan, backup, _decision(backup, stranger, a, dedupe.coverage_gaps(stranger, a)))
+    except OutlookError as e:
+        assert "not in one review group" in str(e)
+    else:
+        raise AssertionError("expected OutlookError")
+
+
+def test_a_decision_is_not_carried_out_if_the_live_copy_now_loses_more():
+    a, b, backup, plan = _differing_pair()
+    decisions = _decision(backup, a, b, dedupe.coverage_gaps(a, b))
+    book = _FakeBook(backup)
+    was = book.live[a["record"]["Id"]]
+    book.live[a["record"]["Id"]] = {**was, "record": {**was["record"], "PersonalNotes": "added since"}}  # same ChangeKey
+    with tempfile.NamedTemporaryFile("r", suffix=".jsonl") as log:
+        tally = dedupe.apply(book, plan, backup, log.name, decisions=decisions)
+    assert book.deleted == [] and tally["skipped"] == 1
+
+
+def test_review_page_carries_decision_controls_except_for_group_members():
+    from outlook_cdp import dedupe_review
+    a, b, backup, plan = _differing_pair()
+    page = dedupe_review.render(backup, plan)
+    assert page.count("class='decide'") == 2 and "Download decisions" in page and "class='gdata'" in page
+
+
 def test_apply_refuses_another_mailbox():
     a, b = (_entry(MobilePhone1="5555550100") for _ in range(2))
     backup = _backup(a, b)

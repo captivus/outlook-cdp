@@ -163,9 +163,10 @@ outlook-cdp --instance my-instance contacts dedupe-plan --backup backups/contact
     --out plan.json --ignore-category "Some marker category"      # offline; --same-folder to stay in folders
 outlook-cdp --instance my-instance contacts dedupe-review --backup backups/... --plan plan.json \
     --out review.html                       # offline: side-by-side tables of what each copy alone holds
-# read plan.json (and review.html); set "approved": true on any name-only match you want gone
+# open review.html: tick "Delete this contact" where you want one gone, choose which contact it gives way
+# to, accept any loss it shows, and "Download decisions" (or set "approved": true in plan.json)
 outlook-cdp --instance my-instance contacts dedupe-apply --mailbox me --backup backups/... --plan plan.json \
-    --log apply-log.jsonl                                        # dry run: lists what it would delete
+    --log apply-log.jsonl [--decisions decisions-<stamp>.json]   # dry run: lists what it would delete
 outlook-cdp --instance my-instance contacts dedupe-apply ... --delete [--limit 10]
 outlook-cdp --instance my-instance contacts restore --mailbox me --backup backups/... --id ID-IN-BACKUP
 ```
@@ -173,7 +174,8 @@ outlook-cdp --instance my-instance contacts restore --mailbox me --backup backup
 `outlook_cdp/dedupe.py` documents exactly what counts as "already held" (case counts in names, numbers must
 be in the same kind of slot, an extension is part of the number, a ZIP is held only by itself or its
 ZIP+4, unknown properties are never held) and what `apply` re-checks against the live book before each
-deletion.
+deletion. A decision from the review page may delete a contact despite a loss, but only the exact loss
+the page showed and you accepted: `apply` refuses it if the backup or the live copies would lose more.
 
 `Reader(session, mailbox=...)` takes the mailbox explicitly for a tab whose URL names none.
 
@@ -467,7 +469,7 @@ python3 tests/test_text.py && python3 tests/test_guards.py && \
     python3 tests/test_contacts.py && python3 tests/test_dedupe.py
 ```
 
-145 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+150 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.

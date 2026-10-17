@@ -122,6 +122,7 @@ def main(argv=None) -> int:
                    help="dedupe-plan: only treat contacts in the same folder as duplicates")
     k.add_argument("--ignore-category", action="append", default=[], metavar="NAME",
                    help="dedupe-plan: a category that is not information (repeatable)")
+    k.add_argument("--decisions", default="", help="dedupe-apply: a decisions file saved from the review page")
     k.add_argument("--log", default="", help="dedupe-apply: JSON-lines log, appended to")
     k.add_argument("--limit", type=int, default=0, help="dedupe-apply: stop after this many deletions")
     k.add_argument("--delete", action="store_true",
@@ -322,13 +323,17 @@ def contacts_cmd(a, s: Session) -> int:
                 print("dedupe-apply needs --backup, --plan and --log", file=sys.stderr)
                 return 2
             plan, backup = dedupe.load(a.plan), dedupe.load(a.backup)
+            decisions = dedupe.load(a.decisions) if a.decisions else None
             if not a.delete:
-                todo = dedupe.approved(plan)[:a.limit or None]
-                print(json.dumps({"would_delete": len(todo), "first": [
+                chosen = dedupe.checked_decisions(plan, backup, decisions) if decisions else []
+                todo = (dedupe.approved(plan) + chosen)[:a.limit or None]
+                print(json.dumps({"would_delete": len(todo), "of_them_by_your_decision": len(chosen),
+                                  "decided": [{"delete": d["delete"]["name"], "keep": d["keep"]["name"],
+                                               "losing": d["accepted_loss"]} for d in chosen], "first": [
                     {"delete": d["delete"]["name"], "keep": d["keep"]["name"]} for d in todo[:20]]}, indent=1))
                 print("Nothing deleted. Add --delete to carry out the plan.", file=sys.stderr)
                 return 0
-            print(json.dumps(dedupe.apply(book, plan, backup, a.log, limit=a.limit or None)))
+            print(json.dumps(dedupe.apply(book, plan, backup, a.log, limit=a.limit or None, decisions=decisions)))
             return 0
         if a.action == "list":
             print(json.dumps([show(c) for c in book.list()], indent=1))
