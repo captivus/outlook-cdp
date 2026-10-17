@@ -410,8 +410,9 @@ def richness(entry: dict) -> int:
 
 def display(entry: dict) -> str:
     r = entry["record"]
-    return r.get("DisplayName") or " ".join(
-        p for p in (r.get("GivenName"), r.get("Surname")) if p) or next(iter(_emails(entry)), "") or "(no name)"
+    return (r.get("DisplayName") or " ".join(p for p in (r.get("GivenName"), r.get("Surname")) if p)
+            or r.get("CompanyName") or next(iter(sorted(_emails(entry))), "")
+            or next(iter(_phones(entry).values()), "") or "(no name)")
 
 
 def _union(entries: list[dict], keys) -> list[list[int]]:

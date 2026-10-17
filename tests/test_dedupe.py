@@ -280,6 +280,18 @@ def test_same_folder_only():
     assert dedupe.plan(backup, across_folders=False)["delete"] == []
 
 
+# ------------------------------------------------------------------ the review page
+
+def test_review_page_shows_each_contacts_unique_values_escaped():
+    from outlook_cdp import dedupe_review
+    a = _entry(MobilePhone1="5555550100", JobTitle="<b>Engineer</b>", ews={"JobTitle": "<b>Engineer</b>"})
+    b = _entry(MobilePhone1="5555550100", GivenName="Sam", DisplayName="Sam Example")
+    backup = _backup(a, b)
+    page = dedupe_review.render(backup, dedupe.plan(backup))
+    assert "&lt;b&gt;Engineer&lt;/b&gt;" in page and "<b>Engineer</b>" not in page
+    assert "Each holds something (1)" in page and "class='only'" in page
+
+
 # ------------------------------------------------------------------ applying
 
 class _FakeBook:
