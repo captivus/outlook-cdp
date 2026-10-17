@@ -327,3 +327,36 @@ the chrome-agent instance name. The two `example.gov` strings a grep turns up in
 ("a two-message thread", "one real mailbox", "the test mailbox"), and the one numeric detail I kept —
 23 rows of 88 — is a scroller limit with nothing identifying in it. No mail, bodies or attachments were
 written anywhere in the repo. I have run no git network operation at any point.
+
+---
+
+## 2026-10-17 11:40 CDT — Claude — Inbox rules over REST (`rules.py`)
+
+New module `outlook_cdp/rules.py`: `Rule`, `Rules` (`list`, `get`, `find`, `create`, `delete`,
+`set_enabled`, `preview`, `apply`) and `rest_send` for non-GET verbs, kept out of `attachments.py` so
+that module stays GET-only as its docstring promises. CLI gained `rules list|preview|add|apply|delete`.
+
+Verified against one real mailbox: a preview matched exactly the intended set (and none of the
+same sender's other notices), one rule was created, and the read-back matched what was sent. Found on
+the way, now README behaviours 40–45: the cached token carries `MailboxSettings.ReadWrite`; `Sequence` is
+required and must be ≥1; the server may drop unknown condition keys, so `create` reads back and deletes
+on mismatch; the well-known Archive folder's display name differed from "Archive" and an unrelated
+folder had that name; rules act only on arrivals, so `apply` is explicit; a tab on `/mail/` names no
+mailbox, so `Rules` requires `mailbox=` (the CLI's `--mailbox me` resolves the signed-in address).
+
+`apply` was **not** run. 10 offline tests in `tests/test_rules.py`, 94 across the suite, CI line updated.
+`session.py`, `reading.py` and `attachments.py` untouched.
+
+---
+
+## 2026-10-17 12:05 CDT — Claude — Addendum: `apply` run, CLI search, `Reader(mailbox=)`
+
+`rules apply` was then run on request and moved every message the preview matched; a follow-up
+preview found none left in the source folder and all of them in the destination. One lesson: a first
+`apply` was interrupted part-way and had already moved some messages, so **re-preview before
+re-applying** rather than trusting an earlier count. `rules preview|apply --name X` with no condition
+flags now loads the stored rule, so what is applied is exactly what is live, not a retyped copy.
+
+Also added `Reader(session, mailbox=...)` for tabs whose URL names no mailbox (previously callers had to
+set a private attribute), and an `outlook-cdp search` command: `$search` text, or `--from` for an exact
+sender with no `$search` cap, plus `--summary` to count by sender/subject/folder.

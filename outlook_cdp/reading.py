@@ -363,10 +363,12 @@ class Reader:
     all.  The `*_dom` methods drive the UI and therefore **mark what they open read**.
     """
 
-    def __init__(self, session: Session, *, wake: bool = True):
+    def __init__(self, session: Session, *, wake: bool = True, mailbox: str | None = None):
+        """`mailbox` overrides the tab URL's, which a tab on plain ``/mail/`` does not carry."""
         self.s = session
         self._token: str | None = None
-        self._base: str | None = None
+        self._base: str | None = ("/api/v2.0/users/" + urllib.parse.quote(mailbox.lower(), safe="")
+                                  if mailbox else None)
         self._folders: dict[str, str] | None = None
         if wake:
             self.wake()

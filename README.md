@@ -101,6 +101,36 @@ for hit in r.search("some phrase"):          # individual messages, not collapse
     print(hit.folder, hit.received, hit.sender, hit.subject)
 ```
 
+Inbox rules are REST too — created, read back and checked, without the settings dialog:
+
+```python
+from outlook_cdp import Session, Rules, Rule
+
+s = Session("my-chrome-agent-instance")
+rules = Rules(s)                     # a tab on plain /mail/ names no mailbox: pass mailbox= explicitly
+
+rule = Rule("Archive build notices", from_addresses=["ci@example.com"],
+            subject_contains=["Build succeeded"], move_to="archive")
+print(len(rules.preview(rule)))      # what it would have caught already; changes nothing
+rules.create(rule)                   # refuses a duplicate name; deletes it again if the server altered it
+rules.apply(rule)                    # optional: rules act only on new mail, this moves the existing matches
+```
+
+```
+outlook-cdp --instance my-instance rules preview --mailbox me \
+    --from ci@example.com --subject-contains "Build succeeded"
+outlook-cdp --instance my-instance rules add --mailbox me --name "Archive build notices" \
+    --from ci@example.com --subject-contains "Build succeeded" --move-to archive
+outlook-cdp --instance my-instance rules list --mailbox me
+outlook-cdp --instance my-instance rules apply --mailbox me --name "Archive build notices"
+    # --name alone uses the rule exactly as stored, so what is applied is what is live
+
+outlook-cdp --instance my-instance search "some phrase" --mailbox me --top 50
+outlook-cdp --instance my-instance search --from ci@example.com --folder archive --top 1000 --summary
+```
+
+`Reader(session, mailbox=...)` takes the mailbox explicitly for a tab whose URL names none.
+
 `Reader` also has a `*_dom` method for each of those, which drives the UI instead. They exist for a page
 with no usable token and they **mark what they open read**, so the REST calls are the ones to use.
 
@@ -289,6 +319,24 @@ quietly wrong rather than loudly broken.
     `innerHeight`, and scroll and **re-measure** before clicking, because the scroll is animated and a
     rectangle taken in the same breath as the request to scroll describes where the element was.
 
+40. **The cached REST token can write inbox rules.** It carries `MailboxSettings.ReadWrite`, so
+    `/mailfolders/inbox/messagerules` takes a POST from inside the page with no consent prompt and no
+    settings UI to drive.
+41. **A rule needs a `Sequence`, and 0 is not one.** Omit it and the server answers
+    `MessageRuleValidationError … Field: 'Sequence', Value: '0'`. `Rules.create` puts a new rule last.
+42. **A stored rule is not proof of the rule you sent.** The server ignores condition keys it does not
+    recognise rather than refusing them, and a rule left with no conditions matches every message. Read
+    the rule back and compare; `Rules.create` deletes it again on any difference.
+43. **The well-known `archive` folder need not be called "Archive".** In one mailbox it was "Archive1",
+    with an ordinary, empty folder called "Archive" beside it. Moving by display name would have filed
+    mail into the folder Outlook's Archive button never uses. Resolve `mailfolders/archive` to its id.
+44. **Rules only act on arrivals.** Outlook's "run rule now" has no REST call; `Rules.apply` is the
+    explicit stand-in and is never run implicitly.
+45. **The tab URL does not always name the mailbox.** A tab on `/mail/` or a deep link carries none, so
+    `mailbox_identity()` returns `None` and every REST helper refuses. For the signed-in user's own
+    mailbox, `/api/v2.0/me`'s `EmailAddress` is the address to pass — never a silent fallback, because
+    on a shared mailbox `me` is someone else.
+
 ## Design rules
 
 **Discover what the page offers; never assume one shape.** The same mailbox in two configurations differs
@@ -319,6 +367,7 @@ verified draft left open for a human to look at.
 | `outlook_cdp/mail.py` | open / fill / read back / send, and discard |
 | `outlook_cdp/attachments.py` | enumerating and downloading attachments, read-only, without the attachment UI |
 | `outlook_cdp/reading.py` | folder listings, message bodies and search — over REST, with a DOM fallback |
+| `outlook_cdp/rules.py` | inbox rules: list, preview, create with read-back verification, apply, delete |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |
 | `outlook_cdp/text.py` | plain text to Outlook HTML, and whitespace-normalised comparison |
 | `outlook_cdp/cli.py` | the command line |
@@ -328,10 +377,10 @@ verified draft left open for a human to look at.
 
 ```
 python3 tests/test_text.py && python3 tests/test_guards.py && \
-    python3 tests/test_attachments.py && python3 tests/test_reading.py
+    python3 tests/test_attachments.py && python3 tests/test_reading.py && python3 tests/test_rules.py
 ```
 
-84 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+94 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.
