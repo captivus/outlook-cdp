@@ -164,7 +164,8 @@ outlook-cdp --instance my-instance contacts dedupe-plan --backup backups/contact
 outlook-cdp --instance my-instance contacts dedupe-review --backup backups/... --plan plan.json \
     --out review.html                       # offline: side-by-side tables of what each copy alone holds
 # open review.html: tick "Delete this contact" where you want one gone, choose which contact it gives way
-# to, accept any loss it shows, and "Download decisions" (or set "approved": true in plan.json)
+# to, accept any loss it shows, and "Download decisions" (or set "approved": true in plan.json).
+# Vim-like keys: j/k groups, h/l contacts, d delete, s keeper, a accept, m reviewed+next, u undo, W download, ? help
 outlook-cdp --instance my-instance contacts dedupe-apply --mailbox me --backup backups/... --plan plan.json \
     --log apply-log.jsonl [--decisions decisions-<stamp>.json]   # dry run: lists what it would delete
 outlook-cdp --instance my-instance contacts dedupe-apply ... --delete [--limit 10]
