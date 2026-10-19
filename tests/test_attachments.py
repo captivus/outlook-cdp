@@ -36,6 +36,7 @@ class FakeSession:
         return self._url
 
 
+
 @contextmanager
 def raises(exc, needle=""):
     """Local stand-in for pytest.raises, so these run under bare `python3` like the other tests."""
@@ -140,9 +141,20 @@ def test_mailbox_base_targets_the_mailbox_on_screen_not_me():
     assert "/me" not in base
 
 
-def test_mailbox_base_refuses_rather_than_guessing():
+def test_mailbox_base_falls_back_to_me_when_the_url_names_none():
+    # A personal account's tab is on bare `/mail/`, so there is no mailbox in the URL. There the
+    # signed-in user IS the mailbox, so /me is the right - and only - answer, unlike a shared mailbox.
+    s = FakeSession([_token(3600), {"status": 200, "body": {"EmailAddress": "me@outlook.com"}}],
+                    mailbox=None)
+    base = A.mailbox_base(s)
+    assert base == "/api/v2.0/users/me%40outlook.com"
+    assert not base.endswith("/me")
+
+
+def test_mailbox_base_refuses_when_neither_the_url_nor_me_names_a_mailbox():
+    s = FakeSession([_token(3600), {"status": 200, "body": {}}], mailbox=None)
     with raises(OutlookError, "which mailbox"):
-        A.mailbox_base(FakeSession(mailbox=None))
+        A.mailbox_base(s)
 
 
 def test_open_conversation_id_is_read_from_the_tab_url_and_unescaped():

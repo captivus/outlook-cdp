@@ -68,7 +68,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 
-from .attachments import access_token, rest_get
+from .attachments import auth_header, rest_get, resolve_mailbox
 from .rules import rest_send
 from .session import OutlookError, Session
 
@@ -102,7 +102,7 @@ _SLICE = 60_000
 _PHOTO_JS = """(async()=>{try{
   const bin=atob(window.__ocdpPhoto.join('')); delete window.__ocdpPhoto;
   const bytes=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-  const r=await fetch(%s,{method:'PUT',headers:{authorization:'Bearer '+%s,'content-type':%s},body:bytes});
+  const r=await fetch(%s,{method:'PUT',headers:{authorization:%s,'content-type':%s},body:bytes});
   return {status:r.status, body:await r.text()}}catch(e){delete window.__ocdpPhoto;return {status:0, body:String(e)}}})()"""
 
 _SELECT = ",".join(["Id", "HomePhones", "BusinessPhones", "EmailAddresses", "HomeAddress",
@@ -143,7 +143,7 @@ _PHOTO_BATCH = 50
 
 #: Fetch each id's photo as base64, or the HTTP status when there is none (404).
 _PHOTOS_JS = """(async()=>{const out={};for(const id of %s){try{
-  const r=await fetch(%s+'/'+encodeURIComponent(id)+'/photo/$value',{headers:{authorization:'Bearer '+%s}});
+  const r=await fetch(%s+'/'+encodeURIComponent(id)+'/photo/$value',{headers:{authorization:%s}});
   if(r.status!==200){out[id]=r.status;continue}
   const b=new Uint8Array(await r.arrayBuffer());let s='';
   for(let i=0;i<b.length;i+=8192) s+=String.fromCharCode.apply(null,b.subarray(i,i+8192));
@@ -152,7 +152,7 @@ _PHOTOS_JS = """(async()=>{const out={};for(const id of %s){try{
 
 #: POST one request to Outlook's own JSON service; returns its response messages, or the error body.
 _OWA_JS = """(async()=>{const r=await fetch('/owa/service.svc?action='+%s+'&app=Mail',{method:'POST',
-  headers:{authorization:'Bearer '+%s,action:%s,'content-type':'application/json; charset=utf-8'},body:%s});
+  headers:{authorization:%s,action:%s,'content-type':'application/json; charset=utf-8'},body:%s});
   let d=null;try{d=await r.json()}catch(e){}
   const m=d&&d.Body&&d.Body.ResponseMessages&&d.Body.ResponseMessages.Items;
   return {status:r.status, messages:m||null, error:m?null:JSON.stringify(d).slice(0,400)}})()"""
@@ -300,11 +300,7 @@ class Contacts:
 
     def __init__(self, session: Session, mailbox: str | None = None):
         self.s = session
-        self.mailbox = (mailbox or session.mailbox_identity() or "").lower() or None
-        if not self.mailbox:
-            raise OutlookError(
-                "cannot tell which mailbox this tab is showing: its URL names none. Pass mailbox= "
-                "explicitly (Rules.signed_in_address(session) gives the signed-in user's address).")
+        self.mailbox = resolve_mailbox(session, mailbox)
         self.base = "/api/v2.0/users/" + urllib.parse.quote(self.mailbox, safe="") + "/contacts"
         self._token: str | None = None
         self._token_at = 0.0
@@ -314,7 +310,7 @@ class Contacts:
         """The page's token, re-read every ten minutes so a long backup or apply outlives one token."""
         at = getattr(self, "_token_at", 0.0)
         if self._token is None or (at and time.time() - at > 600):
-            self._token, self._token_at = access_token(self.s), time.time()
+            self._token, self._token_at = auth_header(self.s), time.time()
         return self._token
 
     def list(self) -> list[Contact]:
