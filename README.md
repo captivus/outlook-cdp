@@ -251,6 +251,11 @@ quietly wrong rather than loudly broken.
     `offsetParent`, and a trusted mouse click at its centre does nothing. **Enter** dismisses it, OK being
     the default; a JS `.click()` also works. The original script clicked the coordinates, which is why a
     draft with content was never really discarded and one sat open in a live mailbox for two days.
+    *Condition-dependent:* the Enter-dismisses observation above was on a work account with the tab's
+    foreground state unrecorded. On a personal (outlook.com) mailbox with the tab **backgrounded**,
+    neither Enter alone nor a trusted click dismissed it in one go (n=1); the reliable path there was
+    behaviour 18 — re-assert lifecycle-active immediately before *each* interaction, which took about two
+    rounds. So treat "Enter dismisses it" as the foreground case and behaviour 18 as the background case.
 18. **Focus emulation must be re-asserted immediately before a click**, not once when the session is
     created. The same Discard click left the pane open for twenty seconds without it and closed in under
     one with it.
