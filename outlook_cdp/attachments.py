@@ -49,9 +49,14 @@ from dataclasses import dataclass
 
 from .session import OutlookError, Session
 
-#: Scope fragment of the token that authenticates the Outlook REST API.  Matched as a substring
-#: against the MSAL cache entry's ``target``, which is a space-separated scope list.
-REST_SCOPE = "outlook.office.com/Mail.ReadWrite"
+#: Scope fragment of the token that authenticates the Outlook REST API.  Matched case-insensitively
+#: as a substring of the MSAL cache *key*, whose last field is the token's scope list.  ``Mail.Read``
+#: is deliberately looser than ``Mail.ReadWrite`` because the two kinds of account scope the same
+#: token differently - a work account's reads ``.../Mail.ReadWrite``, a personal account's reads
+#: ``api://<owa-app-id>/.../Mail.Read ... MailboxFolder.ReadWrite ... Contact.ReadWrite`` - and both
+#: contain ``Mail.Read``, while the personal account's separate MSA ``MBI_SSL`` ticket (which cannot
+#: write rules) does not, so it is correctly skipped.
+REST_SCOPE = "Mail.Read"
 
 #: Scope fragment of the separate, narrower token Outlook mints for ``attachments.office.net``.  Not
 #: needed by anything here - the REST ``$value`` endpoint serves the same bytes from the page's own
@@ -103,30 +108,59 @@ class Attachment:
 
 # --------------------------------------------------------------------------- credentials
 
-#: Pulls one access token out of the page's MSAL cache.  MSAL stores each token as a JSON blob in
-#: localStorage under a key containing ``|accesstoken|``; the blob's ``target`` is the granted scope
-#: list and ``secret`` is the JWT.  Matching on scope rather than on the key means this keeps working
-#: across MSAL's cache-key format changes, which have happened before.
-_TOKEN_JS = """(()=>{const want=%s;let best=null;
+#: Pulls one access token out of the page's MSAL cache.  MSAL stores each token under a localStorage
+#: key containing ``|accesstoken|`` whose last ``|`` field is the scope list; the value is a JSON blob.
+#:
+#: Two storage shapes, one pass handles both:
+#:
+#: * **Work / school** (outlook.office.com, outlook.cloud.microsoft): the blob is plaintext, with the
+#:   JWT in ``secret``.
+#: * **Personal** (outlook.com, outlook.live.com): the blob is ``{id, nonce, data}`` and the JWT is
+#:   AES-GCM encrypted.  The page decrypts it exactly as Outlook itself does: the key is HKDF-SHA256
+#:   of the raw key in the ``msal.cache.encryption`` cookie, salted with the blob's ``nonce`` and
+#:   info'd with the client-id (the 5th ``|`` field of the cache key); the IV is twelve zero bytes.
+#:
+#: The decrypted personal token is an ordinary bearer JWT carrying the OWA app's mail scopes, so from
+#: here on there is no difference between the two accounts - both are ``"Bearer " + secret``.  Matching
+#: on the key (not the decrypted ``target``) is what lets the scope filter run before decryption.
+_TOKEN_JS = """(async()=>{
+  const want=%s.toLowerCase();
+  const b64u=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')+'==='.slice((s.length+3)%%4)),c=>c.charCodeAt(0));
+  let base=null;
+  const ck=document.cookie.split('; ').find(c=>c.startsWith('msal.cache.encryption='));
+  if(ck){try{const kv=JSON.parse(decodeURIComponent(ck.split('=').slice(1).join('=')));
+    base=await crypto.subtle.importKey('raw',b64u(kv.key),'HKDF',false,['deriveKey']);}catch(e){}}
+  let best=null;
   for(const k of Object.keys(localStorage)){
-    if(!/\\|accesstoken\\|/.test(k)) continue;
+    if(!/\\|accesstoken\\|/.test(k)||!k.toLowerCase().includes(want)) continue;
     let v; try{v=JSON.parse(localStorage.getItem(k))}catch(e){continue}
-    if(!v||!v.secret||!(v.target||'').includes(want)) continue;
-    const exp=parseInt(v.expiresOn||'0',10)||0;
-    if(!best||exp>best.expires) best={secret:v.secret,expires:exp};
+    let secret=v&&v.secret, exp=parseInt((v&&v.expiresOn)||'0',10)||0;
+    if(!secret && v && v.nonce && v.data && base){
+      try{
+        const dk=await crypto.subtle.deriveKey(
+          {name:'HKDF',salt:b64u(v.nonce),hash:'SHA-256',info:new TextEncoder().encode(k.split('|')[4])},
+          base,{name:'AES-GCM',length:256},false,['decrypt']);
+        const pt=JSON.parse(new TextDecoder().decode(
+          await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(12)},dk,b64u(v.data))));
+        secret=pt.secret; exp=parseInt(pt.expiresOn||'0',10)||0;
+      }catch(e){continue}
+    }
+    if(!secret) continue;
+    if(!best||exp>best.expires) best={secret:secret,expires:exp};
   }
   return best})()"""
 
 
 def access_token(session: Session, scope: str = REST_SCOPE, min_ttl: float = 30.0) -> str:
-    """The page's own access token for `scope`, read from its MSAL cache.
+    """The page's own access token for `scope`, read (and, on a personal account, decrypted) from its
+    MSAL cache.
 
     There is no way to *mint* a token from outside the page, so this borrows one Outlook already has.
     They are short-lived - an hour is typical - and Outlook refreshes them silently as long as the tab
     is alive, so a token that is expired here means the tab has been idle rather than that anything is
     broken; touching the mailbox in the UI, or simply waiting for Outlook's own next poll, replaces it.
     """
-    got = session.js(_TOKEN_JS % json.dumps(scope))
+    got = session.js(_TOKEN_JS % json.dumps(scope), await_promise=True)
     if not got:
         raise OutlookError(
             f"no access token for scope {scope!r} in the page's MSAL cache. Either the tab is not "
@@ -139,18 +173,45 @@ def access_token(session: Session, scope: str = REST_SCOPE, min_ttl: float = 30.
     return got["secret"]
 
 
-def mailbox_base(session: Session) -> str:
+def auth_header(session: Session, scope: str = REST_SCOPE, min_ttl: float = 30.0,
+                refresh: bool = False) -> str:
+    """The full ``Authorization`` header value the page's own REST calls would send.
+
+    Both account kinds authenticate the *same* API with a bearer JWT; they only differ in how that
+    JWT is stored (plaintext for work, encrypted for personal), and `access_token` hides that
+    difference.  `refresh` is accepted so a 401-retry caller has a uniform signature, but needs
+    nothing done here: `access_token` re-reads the cache every call, and the tab keeps it fresh.
+    """
+    return "Bearer " + access_token(session, scope, min_ttl)
+
+
+def resolve_mailbox(session: Session, mailbox: str | None = None) -> str:
+    """The address whose mailbox a REST call should target, lower-cased.
+
+    `mailbox`, if given, wins.  Otherwise the tab URL is asked first - it names the mailbox on a
+    work session (``/mail/office@example.com/``) and, crucially, is the *shared* mailbox when one is
+    open, which ``/me`` is not.  A personal session's URL is just ``/mail/``, so there the signed-in
+    user's own address from ``/api/v2.0/me`` is both correct and the only answer available.
+    """
+    mb = (mailbox or session.mailbox_identity() or "").strip().lower()
+    if mb:
+        return mb
+    mb = (rest_get(session, "/api/v2.0/me").get("EmailAddress") or "").strip().lower()
+    if not mb:
+        raise OutlookError(
+            "cannot tell which mailbox this tab is showing: its URL names none and /api/v2.0/me "
+            "returned no address. Pass mailbox= explicitly.")
+    return mb
+
+
+def mailbox_base(session: Session, mailbox: str | None = None) -> str:
     """The REST path prefix for the mailbox this tab is showing.
 
-    Deliberately not ``/api/v2.0/me``.  See the module docstring: ``me`` is the signed-in account,
-    which for a shared mailbox is somebody else's mail entirely.
+    Deliberately not ``/api/v2.0/me`` when the URL names a mailbox.  See the module docstring: on a
+    shared mailbox ``me`` is somebody else's mail entirely.  Only when nothing names a mailbox - a
+    personal account's bare ``/mail/`` - does `resolve_mailbox` fall back to the signed-in address.
     """
-    mailbox = session.mailbox_identity()
-    if not mailbox:
-        raise OutlookError(
-            "cannot tell which mailbox this tab is showing - Session.mailbox_identity() read nothing "
-            "from the tab URL, so a REST call would silently read the signed-in user's mail instead.")
-    return "/api/v2.0/users/" + urllib.parse.quote(mailbox, safe="")
+    return "/api/v2.0/users/" + urllib.parse.quote(resolve_mailbox(session, mailbox), safe="")
 
 
 # --------------------------------------------------------------------------- REST
@@ -158,7 +219,7 @@ def mailbox_base(session: Session) -> str:
 #: Same-origin GET with the borrowed bearer token, run inside the page.  Returns the parsed body and
 #: the status separately so a caller can tell "no attachments" from "the request was refused".
 _REST_JS = """(async()=>{try{
-  const r=await fetch(%s,{headers:{authorization:'Bearer '+%s,accept:'application/json'}});
+  const r=await fetch(%s,{headers:{authorization:%s,accept:'application/json'}});
   let body=null; try{body=await r.json()}catch(e){}
   return {status:r.status, body:body}}catch(e){return {status:0, error:String(e)}}})()"""
 
@@ -169,7 +230,7 @@ def rest_get(session: Session, path: str, token: str | None = None) -> dict:
     `path` must already be query-encoded; OData's ``$filter`` and friends need literal ``$`` and the
     values inside them need percent-encoding, so encoding the whole thing here would corrupt it.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     out = session.js(_REST_JS % (json.dumps(path), json.dumps(token)), await_promise=True) or {}
     if out.get("status") != 200:
         body = out.get("body") or {}
@@ -189,7 +250,7 @@ def messages_with_attachments(session: Session, folder: str = "inbox", top: int 
     with ``InefficientFilter``, and dropping the sort to keep the filter returns the mailbox in
     arrival order oldest-first, which is the opposite of what any caller wants.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     path = (f"{mailbox_base(session)}/mailfolders/{urllib.parse.quote(folder)}/messages"
             f"?$top={int(top)}&$orderby=ReceivedDateTime%20desc"
             f"&$select=Id,Subject,From,ReceivedDateTime,HasAttachments,IsRead,ConversationId")
@@ -204,7 +265,7 @@ def list_attachments(session: Session, message_id: str, token: str | None = None
     Inline images are excluded by default: a signature block routinely contributes three or four
     logos, and a caller asking for "the attachments" almost never means those.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     path = (f"{mailbox_base(session)}/messages/{urllib.parse.quote(message_id, safe='')}/attachments"
             f"?$select=Id,Name,Size,ContentType,IsInline")
     out = []
@@ -241,7 +302,7 @@ def open_conversation_messages(session: Session, token: str | None = None) -> li
     conv = open_conversation_id(session)
     if not conv:
         raise OutlookError("no message is open in the reading pane (the tab URL carries no /id/ part)")
-    token = token or access_token(session)
+    token = token or auth_header(session)
     path = (f"{mailbox_base(session)}/messages"
             f"?$top=50&$select=Id,Subject,From,ReceivedDateTime,HasAttachments,IsRead"
             f"&$filter=ConversationId%20eq%20'{urllib.parse.quote(conv, safe='')}'")
@@ -257,7 +318,7 @@ def open_message_attachments(session: Session, token: str | None = None,
     you which member it is showing, and an attachment that arrived on the reply is the one the caller
     came for.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     found: list[Attachment] = []
     for msg in open_conversation_messages(session, token):
         if msg.get("HasAttachments"):
@@ -285,7 +346,7 @@ def tile_labels(session: Session) -> list[str]:
 #: token - unlike the `attachments.office.net` URL the Download button uses, which is cross-origin and
 #: needs the separate OwaAttachments.Read token.
 _FETCH_JS = """(async()=>{try{
-  const r=await fetch(%s,{headers:{authorization:'Bearer '+%s}});
+  const r=await fetch(%s,{headers:{authorization:%s}});
   if(!r.ok) return {status:r.status};
   const b=await r.arrayBuffer();
   %s={bytes:new Uint8Array(b), type:r.headers.get('content-type')||''};
@@ -371,7 +432,7 @@ def download(session: Session, att: Attachment, dest_dir: str, *, filename: str 
     Raises rather than leaving a half-written file in place, because a truncated record that looks
     like a record is worse than no record.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     safe = _safe_name(filename or att.name or att.attachment_id)
     os.makedirs(dest_dir, exist_ok=True)
     path = os.path.join(dest_dir, safe)
@@ -431,7 +492,7 @@ def download_all(session: Session, attachments, dest_dir: str, **kw) -> list[dic
     Names collide - three public bodies will all send you ``response.pdf`` - so a name already taken
     in `dest_dir` gets a ``-2``, ``-3`` suffix rather than overwriting what is there.
     """
-    token = kw.pop("token", None) or access_token(session)
+    token = kw.pop("token", None) or auth_header(session)
     records = []
     for att in attachments:
         records.append(download(session, att, dest_dir,

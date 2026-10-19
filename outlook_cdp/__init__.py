@@ -38,7 +38,8 @@ from .recipients import chip_addresses, resolved_recipients, well_text   # noqa:
 from .dom import (pierce_find, box_center, center_of,                # noqa: F401
                   center_in_viewport, scroll_into_view_center)
 from .text import to_html, normalise                               # noqa: F401
-from .attachments import (Attachment, access_token, list_attachments,      # noqa: F401
+from .attachments import (Attachment, access_token, auth_header, resolve_mailbox,  # noqa: F401
+                          list_attachments,
                           messages_with_attachments, open_message_attachments,
                           open_conversation_messages, download, download_all, verify_file)
 from .rules import Rule, Rules, rest_send                          # noqa: F401
@@ -52,7 +53,8 @@ __all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards", "ded
            "html_to_text", "addresses_in",
            "chip_addresses", "resolved_recipients", "well_text",
            "pierce_find", "box_center", "center_of", "to_html", "normalise",
-           "Attachment", "access_token", "list_attachments", "messages_with_attachments",
+           "Attachment", "access_token", "auth_header", "resolve_mailbox",
+           "list_attachments", "messages_with_attachments",
            "open_message_attachments", "open_conversation_messages", "download",
            "download_all", "verify_file", "Rule", "Rules", "rest_send",
            "Contact", "Contacts", "phone_digits"]

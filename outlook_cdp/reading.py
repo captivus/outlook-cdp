@@ -54,7 +54,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-from .attachments import (access_token, list_attachments, mailbox_base,
+from .attachments import (auth_header, list_attachments, mailbox_base,
                           open_conversation_id, rest_get)
 from .session import OutlookError, Session
 
@@ -409,7 +409,7 @@ class Reader:
         expired one means the tab has been idle rather than that anything is broken.
         """
         if refresh or self._token is None:
-            self._token = access_token(self.s)
+            self._token = auth_header(self.s, refresh=refresh)
         return self._token
 
     def rest_available(self) -> bool:

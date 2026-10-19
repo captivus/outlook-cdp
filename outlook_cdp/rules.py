@@ -37,7 +37,7 @@ import json
 import urllib.parse
 from dataclasses import dataclass, field
 
-from .attachments import access_token, rest_get
+from .attachments import auth_header, rest_get, resolve_mailbox
 from .reading import Reader, Row
 from .session import OutlookError, Session
 
@@ -53,7 +53,7 @@ _CONDITION_KEYS = {
 
 #: Same-origin request with the borrowed bearer token, for the verbs `rest_get` deliberately lacks.
 _SEND_JS = """(async()=>{try{
-  const r=await fetch(%s,{method:%s,headers:{authorization:'Bearer '+%s,accept:'application/json',
+  const r=await fetch(%s,{method:%s,headers:{authorization:%s,accept:'application/json',
     'content-type':'application/json'},body:%s});
   let body=null; try{body=await r.json()}catch(e){}
   return {status:r.status, body:body}}catch(e){return {status:0, error:String(e)}}})()"""
@@ -65,7 +65,7 @@ def rest_send(session: Session, method: str, path: str, payload: dict | None = N
 
     Raises on anything but 2xx, with the server's error code, so a refused write never reads as done.
     """
-    token = token or access_token(session)
+    token = token or auth_header(session)
     body = json.dumps(json.dumps(payload)) if payload is not None else "undefined"
     out = session.js(_SEND_JS % (json.dumps(path), json.dumps(method.upper()), json.dumps(token), body),
                      await_promise=True) or {}
@@ -202,11 +202,7 @@ class Rules:
 
     def __init__(self, session: Session, mailbox: str | None = None):
         self.s = session
-        self.mailbox = (mailbox or session.mailbox_identity() or "").lower() or None
-        if not self.mailbox:
-            raise OutlookError(
-                "cannot tell which mailbox this tab is showing: its URL names none. Pass mailbox= "
-                "explicitly (Rules.signed_in_address(session) gives the signed-in user's address).")
+        self.mailbox = resolve_mailbox(session, mailbox)
         self.base = "/api/v2.0/users/" + urllib.parse.quote(self.mailbox, safe="")
         self._token: str | None = None
 
@@ -219,7 +215,7 @@ class Rules:
 
     def token(self) -> str:
         if self._token is None:
-            self._token = access_token(self.s)
+            self._token = auth_header(self.s)
         return self._token
 
     def _get(self, path: str) -> dict:
