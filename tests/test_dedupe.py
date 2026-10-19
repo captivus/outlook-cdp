@@ -468,6 +468,36 @@ def test_review_page_scripts_parse():
         subprocess.run(["node", "--check", "-"], input=script.encode(), check=True)
 
 
+def test_review_page_shows_a_phone_number_either_view_holds():
+    from outlook_cdp import dedupe_review
+    fax = {"PropertyId": "String 0x3A24", "Value": "555-555-0199"}
+    only_rest = _entry(MobilePhone1="555-555-0103", SingleValueExtendedProperties=[fax])
+    rows = dict((label, v) for sec, label, v in dedupe_review._rows(only_rest) if sec == "Phone")
+    assert rows == {"Mobile": "555-555-0103", "Business fax": "555-555-0199"}
+    both = _entry(MobilePhone1="(555) 555-0103",
+                  ews={"PhoneNumbers": [{"Key": "MobilePhone", "PhoneNumber": "555-555-0103"}]})
+    assert [r for r in dedupe_review._rows(both) if r[0] == "Phone"] == [("Phone", "Mobile", "555-555-0103")]
+    split = _entry(MobilePhone1="555-555-0104",
+                   ews={"PhoneNumbers": [{"Key": "MobilePhone", "PhoneNumber": "555-555-0103"}]})
+    assert [r[1:] for r in dedupe_review._rows(split) if r[0] == "Phone"] == [
+        ("Mobile", "555-555-0103"), ("Mobile (other record)", "555-555-0104")]
+
+
+def test_review_page_says_what_a_rest_only_phone_would_lose():
+    from outlook_cdp import dedupe_review
+    a = _entry(EmailAddresses=[{"Name": "", "Address": "pat@example.com"}])
+    b = _entry(MobilePhone1="555-555-0103")
+    page = dedupe_review.render(_backup(a, b), dedupe.plan(_backup(a, b)))
+    assert "Mobile: 555-555-0103" in page and "nothing the table shows" not in page
+
+
+def test_review_page_enter_in_the_filter_goes_to_the_first_match():
+    from outlook_cdp import dedupe_review
+    a, b, backup, plan = _differing_pair()
+    page = dedupe_review.render(backup, plan)
+    assert "e.key==='Enter'&&t===q" in page and "<kbd>Enter</kbd> <kbd>Esc</kbd>" in page
+
+
 def test_apply_refuses_another_mailbox():
     a, b = (_entry(MobilePhone1="5555550100") for _ in range(2))
     backup = _backup(a, b)

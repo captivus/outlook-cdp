@@ -29,7 +29,7 @@ from __future__ import annotations
 import html
 import json
 
-from .contacts import extended
+from .contacts import EXTENDED_PHONES, extended, phone_digits
 from .dedupe import coverage_gaps, display, ews_gaps, rest_gaps
 
 _NAME_FIELDS = [("Title", None, "DisplayNamePrefix"), ("Given name", "GivenName", None),
@@ -45,6 +45,12 @@ _PHONE_LABELS = {"MobilePhone": "Mobile", "HomePhone": "Home phone", "HomePhone2
                  "BusinessFax": "Business fax", "HomeFax": "Home fax", "OtherFax": "Other fax", "Pager": "Pager",
                  "CarPhone": "Car phone", "Callback": "Callback", "AssistantPhone": "Assistant phone",
                  "RadioPhone": "Radio", "Telex": "Telex", "Isdn": "ISDN", "TtyTddPhone": "TTY/TDD"}
+#: The service.svc key for each extended-property phone, so a number read from either view lands in one row.
+_EXTENDED_PHONE_KEYS = {"other_phone": "OtherTelephone", "primary_phone": "PrimaryPhone",
+                        "company_main_phone": "CompanyMainPhone", "business_fax": "BusinessFax",
+                        "home_fax": "HomeFax", "other_fax": "OtherFax", "pager": "Pager", "car_phone": "CarPhone",
+                        "callback_phone": "Callback", "radio_phone": "RadioPhone", "telex": "Telex",
+                        "isdn": "Isdn", "tty_tdd_phone": "TtyTddPhone", "assistant_phone": "AssistantPhone"}
 
 
 def _s(v) -> str:
@@ -67,14 +73,8 @@ def _rows(entry: dict, ignore=()) -> list[tuple[str, str, str]]:
         emails.append(a + (f"  ({n})" if _s(n) and _s(n).lower() != _s(a).lower() else ""))
     for e in sorted(emails, key=str.lower):
         add("Email", "email:" + e.split()[0].lower(), e)       # one row per address, shared where shared
-    for p in x.get("PhoneNumbers") or []:
-        add("Phone", _PHONE_LABELS.get(p.get("Key"), p.get("Key") or "Phone"), p.get("PhoneNumber"))
-    if not x:                                          # no second view: fall back to the REST slots
-        add("Phone", "Mobile", r.get("MobilePhone1"))
-        for i, p in enumerate(r.get("HomePhones") or [], 1):
-            add("Phone", f"Home phone {i}", p)
-        for i, p in enumerate(r.get("BusinessPhones") or [], 1):
-            add("Phone", f"Business phone {i}", p)
+    for key, number in _phones(r, x):
+        add("Phone", key, number)
     for key, label in (("HomeAddress", "Home"), ("BusinessAddress", "Business"), ("OtherAddress", "Other")):
         a = r.get(key) or {}
         add("Address", label, ", ".join(_s(a.get(k)) for k in ("Street", "City", "State", "PostalCode",
@@ -84,7 +84,7 @@ def _rows(entry: dict, ignore=()) -> list[tuple[str, str, str]]:
     add("Work & family", "Children", ", ".join(r.get("Children") or []))
     add("Other", "Business web page", r.get("BusinessHomePage"))
     for name, v in sorted(extended(r).items()):
-        if not name.endswith(("phone", "fax")) and name not in ("pager", "telex", "isdn"):
+        if name not in EXTENDED_PHONES:
             add("Other", name.replace("_", " ").capitalize(), v)
     add("Other", "IM", ", ".join(r.get("ImAddresses") or []))
     add("Other", "Birthday", (r.get("Birthday") or "")[:10])
@@ -99,6 +99,29 @@ def _rows(entry: dict, ignore=()) -> list[tuple[str, str, str]]:
     if _s(notes):
         fmt = (x.get("Body") or {}).get("BodyType")
         add("Notes", "Notes" + (" (HTML)" if fmt == "HTML" else ""), notes.replace("\r\n", "\n").strip())
+    return out
+
+
+def _phones(r: dict, x: dict) -> list[tuple[str, str]]:
+    """Each phone number as (label, number): the service.svc view's list, then any number in a REST slot or
+    extended property that the list lacks. Both views read the same fields, so they normally agree; where
+    they do not, the table still shows every number the checker compares, rather than only one view's."""
+    ews = [(p.get("Key") or "Phone", p.get("PhoneNumber")) for p in x.get("PhoneNumbers") or []
+           if _s(p.get("PhoneNumber"))]
+    rest = [("MobilePhone", r.get("MobilePhone1"))]
+    rest += list(zip(("HomePhone", "HomePhone2"), r.get("HomePhones") or []))
+    rest += list(zip(("BusinessPhone", "BusinessPhone2"), r.get("BusinessPhones") or []))
+    rest += [(_EXTENDED_PHONE_KEYS.get(name, name), v) for name, v in sorted(extended(r).items())
+             if name in EXTENDED_PHONES]
+    held = {(k, phone_digits(n)) for k, n in ews}
+    out = [(_PHONE_LABELS.get(k, k), n) for k, n in ews]
+    for key, number in rest:
+        if not _s(number) or (key, phone_digits(str(number))) in held:
+            continue
+        label = _PHONE_LABELS.get(key, key)
+        if any(k == key for k, _ in ews):              # the slot holds a different number in the other view
+            label += " (other record)"
+        out.append((label, str(number)))
     return out
 
 
@@ -444,7 +467,7 @@ _KEY_HELP = """<h2>Keyboard shortcuts</h2><table>
 <tr><td><kbd>o</kbd> <kbd>Enter</kbd></td><td>open or close the group</td></tr>
 <tr><td><kbd>z</kbd><kbd>z</kbd></td><td>scroll the group to the top again</td></tr>
 <tr><td><kbd>g</kbd><kbd>t</kbd> <kbd>g</kbd><kbd>T</kbd></td><td>next / previous tab</td></tr>
-<tr><td><kbd>/</kbd> <kbd>Esc</kbd></td><td>filter by name / leave the filter</td></tr>
+<tr><td><kbd>/</kbd> <kbd>Enter</kbd> <kbd>Esc</kbd></td><td>filter by name / go to the first match / leave the filter where you are</td></tr>
 <tr><th colspan=2>Deciding (on the focused contact)</th></tr>
 <tr><td><kbd>d</kbd></td><td>delete this contact, or undo that</td></tr>
 <tr><td><kbd>s</kbd> <kbd>S</kbd></td><td>switch which contact it gives way to</td></tr>
@@ -521,6 +544,7 @@ const twos={gg:()=>{const v=vis();go(v[0])}, gt:()=>tab(1), gT:()=>tab(-1),
 document.addEventListener('keydown',e=>{
   const t=e.target, typing=/^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)&&t.type!=='checkbox';
   if(e.key==='Escape'){if(help.open)help.close();if(typing)t.blur();count='';prefix='';echo.textContent='';return}
+  if(e.key==='Enter'&&t===q){e.preventDefault();t.blur();go(vis()[0]);return}
   if(typing||e.ctrlKey||e.metaKey||e.altKey)return;
   if(help.open&&e.key!=='?')return;
   const k=e.key;

@@ -475,7 +475,7 @@ python3 tests/test_text.py && python3 tests/test_guards.py && \
     python3 tests/test_contacts.py && python3 tests/test_dedupe.py
 ```
 
-150 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
+155 tests, no browser required. They cover the text conversion, every guard, the read-path parsing, and the attachment logic
 that decides where bytes land and whether they are believed — including the three cases that matter most:
 a blocked address hidden behind a display name, a truncated paste, and an attachment filename that tries
 to escape its destination directory.
