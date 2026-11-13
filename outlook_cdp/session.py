@@ -131,10 +131,16 @@ class Session:
         return m.group(1).lower() if m else None
 
     def cdp(self, method: str, params: dict | None = None):
-        r = subprocess.run(
-            ["chrome-agent", self.instance, "--target-id", self._target or self.target, method,
-             json.dumps(params or {})],
-            capture_output=True, text=True, timeout=self.timeout)
+        try:
+            r = subprocess.run(
+                ["chrome-agent", self.instance, "--target-id", self._target or self.target, method,
+                 json.dumps(params or {})],
+                capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            # Raised fresh, not chained: TimeoutExpired quotes the whole command line, and for a REST
+            # call that includes the page's bearer token, which must never reach a log or traceback.
+            raise OutlookError(f"{method} on tab {self._target} gave no answer within "
+                               f"{self.timeout:.0f}s; the page may be busy or hung") from None
         try:
             return json.loads(r.stdout)
         except Exception:

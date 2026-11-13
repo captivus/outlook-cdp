@@ -67,6 +67,24 @@ def test_no_outlook_tab_is_refused():
         Stub(TABS[:1]).tab()
 
 
+def test_a_timed_out_call_does_not_leak_its_parameters():
+    import subprocess
+    real = subprocess.run
+
+    def hang(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+    subprocess.run = hang
+    try:
+        Stub(TABS, target="2F214D46").cdp("Runtime.evaluate", {"expression": "Bearer SECRET-TOKEN"})
+    except OutlookError as e:
+        assert "SECRET-TOKEN" not in str(e) and "no answer" in str(e)
+        assert e.__cause__ is None and e.__suppress_context__
+    else:
+        raise AssertionError("expected OutlookError")
+    finally:
+        subprocess.run = real
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
