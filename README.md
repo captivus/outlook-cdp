@@ -153,9 +153,31 @@ book.set_photo(pat.id, open("face.jpg", "rb").read())  # verified by reading the
 
 ```
 outlook-cdp --instance my-instance contacts find --mailbox me --phone 5555550100
+outlook-cdp --instance my-instance contacts find --mailbox me --email pat@example.com
 outlook-cdp --instance my-instance contacts add --mailbox me --json people.json   # one object or a list
 outlook-cdp --instance my-instance contacts update --mailbox me --id ID --json changes.json  # "" clears
 outlook-cdp --instance my-instance contacts photo --mailbox me --id ID --photo face.jpg
+```
+
+Contact groups (Outlook's "contact lists") are made and changed the same way, each write read back and
+compared member by member:
+
+```python
+team = book.create_group("Team", [pat, ("Sam Two", "sam@example.com"), "lee@example.com"])
+book.add_members(team["ItemId"]["Id"], ["new@example.com"])      # addresses already in it are skipped
+book.remove_members(team["ItemId"]["Id"], ["lee@example.com"])
+book.rename_group(team["ItemId"]["Id"], "Team A")                # refuses a name another group has
+```
+
+```
+outlook-cdp --instance my-instance contacts groups --mailbox me
+outlook-cdp --instance my-instance contacts group-create --mailbox me --group Team \
+    --member "Sam Two <sam@example.com>" --member lee@example.com
+outlook-cdp --instance my-instance contacts group-add --mailbox me --group Team --member new@example.com \
+    --members-from-contacts                  # name each member as the contact that holds the address
+outlook-cdp --instance my-instance contacts group-remove --mailbox me --group Team --member lee@example.com
+outlook-cdp --instance my-instance contacts group-rename --mailbox me --group Team --new-name "Team A"
+outlook-cdp --instance my-instance contacts group-delete --mailbox me --group Team
 ```
 
 Backing up and deduplicating a contact book is the same library, never ad hoc. Nothing merges: a duplicate
@@ -433,6 +455,17 @@ quietly wrong rather than loudly broken.
 56. **A group may link to the very contact being deleted.** Group members carry the contact's address and
     an id in a form REST does not use, so a contact whose address is in any group is never deleted by
     `dedupe.apply`, judged on the groups as they are at that moment.
+57. **A group member linked to a contact keeps no name.** service.svc accepts a contact-linked member only
+    as the contact's id alone - a name or address beside it is `ErrorInvalidMailbox` - and that member
+    reads back named by its address. `Contacts.create_group` and `add_members` write one-off members,
+    name and address, which show the person's name and do not depend on a card existing.
+58. **A group's members are one field.** Adding is `AppendToItemField`; nothing removes a single member,
+    so `remove_members` rewrites the remaining list with `SetItemField`. Outlook takes two groups of one
+    name and one address twice in a group, so `create_group` refuses a used name and members are
+    de-duplicated by address. `Contacts.create` likewise now refuses an address already on a contact.
+59. **Removing a member rewrites every member.** So `remove_members` refuses a group holding a member linked
+    to a contact card, a directory user or another group: the rewrite would store it as a plain address,
+    or, for a nested group, as an empty entry. Such a group is changed in Outlook itself.
 
 ## Design rules
 
@@ -465,7 +498,7 @@ verified draft left open for a human to look at.
 | `outlook_cdp/attachments.py` | enumerating and downloading attachments, read-only, without the attachment UI |
 | `outlook_cdp/reading.py` | folder listings, message bodies and search — over REST, with a DOM fallback |
 | `outlook_cdp/rules.py` | inbox rules: list, preview, create with read-back verification, apply, delete |
-| `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete, every folder, groups, verified backup and restore |
+| `outlook_cdp/contacts.py` | contacts: list, find by phone or name, create and update with read-back verification, photos, delete, every folder, groups (read, create, add/remove members, delete), verified backup and restore |
 | `outlook_cdp/dedupe.py` | duplicate contacts: the no-information-lost check, planning from a backup, and a re-verified apply |
 | `outlook_cdp/dedupe_review.py` | a self-contained side-by-side HTML page of what a plan leaves for a person to decide |
 | `outlook_cdp/guards.py` | `Draft` plus the composable checks |

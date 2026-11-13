@@ -55,6 +55,19 @@ records from `list_raw` / `backup`, because the REST contact leaves out much of 
     deleted anyway, so "unchanged since I checked" can only be narrowed, never guaranteed, by re-reading
     just before deleting.  What makes deleting tolerable is that it is soft: a deleted contact moves to
     Deleted Items whole, every MAPI property included, until that folder is emptied.
+
+Contact groups ("contact lists" in Outlook) are written the way they are read, through ``service.svc``:
+
+12. **A member linked to a contact keeps no name.**  A member that points at a contact is accepted only
+    as the contact's service.svc id alone; any name or address beside the id is refused as
+    ``ErrorInvalidMailbox``, and the stored member then reads back with its address as its name.  So
+    `create_group` and `add_members` write one-off members (name and address), which show the person's
+    name and need no contact card behind them.
+13. **The member list is one field.**  Members are added with ``AppendToItemField`` and removed by
+    ``SetItemField`` of the whole remaining list, since nothing removes one member.  Each write is read
+    back with GetItem and compared address by address; a group whose create did not take is deleted again.
+    Outlook accepts two groups with the same name and the same address twice in one group, so
+    `create_group` refuses an existing name and members are de-duplicated by address before sending.
 """
 from __future__ import annotations
 
@@ -173,6 +186,55 @@ def extended(raw: dict) -> dict:
         if val not in (None, "") and not (name == "gender" and str(val) == "0"):
             out[name] = val
     return out
+
+
+def group_members(members) -> list[tuple[str, str]]:
+    """Members as ``(name, address)``, from Contacts (first address), ``(name, address)`` pairs or addresses.
+
+    The same address twice is kept once, in its first position: a group would otherwise list it twice.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in members:
+        if isinstance(m, Contact):
+            if not m.emails:
+                raise OutlookError(f"{m.name() or m.id!r} has no email address to put in a group")
+            name, addr = m.name(), m.emails[0]
+        elif isinstance(m, str):
+            name, addr = "", m
+        else:
+            name, addr = m
+        addr = (addr or "").strip()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", addr):
+            raise OutlookError(f"{addr!r} is not an email address")
+        if addr.lower() not in seen:
+            seen.add(addr.lower())
+            out.append(((name or "").strip() or addr, addr))
+    return out
+
+
+def _member_json(name: str, address: str) -> dict:
+    return {"__type": "Member:#Exchange",
+            "Mailbox": {"__type": "EmailAddress:#Exchange", "Name": name, "EmailAddress": address,
+                        "RoutingType": "SMTP", "MailboxType": "OneOff"}}
+
+
+def stored_members(item: dict) -> list[tuple[str, str]]:
+    """A group item's members as ``(name, address)``, in stored order."""
+    return [((m.get("Mailbox") or {}).get("Name") or "", (m.get("Mailbox") or {}).get("EmailAddress") or "")
+            for m in item.get("Members") or []]
+
+
+def member_differences(want: list[tuple[str, str]], got: list[tuple[str, str]]) -> list[str]:
+    """How a stored member list differs from the one asked for: addresses missing or extra, names changed."""
+    w = {a.lower(): n for n, a in want}
+    g = {a.lower(): n for n, a in got}
+    probs = [f"missing {a}" for a in w if a not in g]
+    probs += [f"unexpected {a}" for a in g if a not in w]
+    probs += [f"{a}: asked name {w[a]!r}, stored {g[a]!r}" for a in w if a in g and _norm(w[a]) != _norm(g[a])]
+    if len(got) != len(g):
+        probs.append("the same address is stored more than once")
+    return probs
 
 
 def phone_digits(number: str) -> str:
@@ -341,17 +403,31 @@ class Contacts:
         return [c for c in (self.list() if contacts is None else contacts)
                 if text.lower() in c.name().lower()]
 
-    def create(self, contact: Contact, *, allow_duplicate_phone: bool = False) -> Contact:
+    def find_by_email(self, address: str, contacts: list[Contact] | None = None) -> list[Contact]:
+        """Contacts carrying `address` in any email slot, case-insensitively."""
+        want = address.strip().lower()
+        return [c for c in (self.list() if contacts is None else contacts)
+                if want in (e.lower() for e in c.emails)]
+
+    def create(self, contact: Contact, *, allow_duplicate_phone: bool = False,
+               allow_duplicate_email: bool = False, existing: list[Contact] | None = None) -> Contact:
         """Create `contact`, read it back, and refuse - deleting it again - if the server changed it.
 
-        Refuses when any of its numbers is already on another contact, unless `allow_duplicate_phone`.
+        Refuses when any of its numbers or addresses is already on another contact, unless
+        `allow_duplicate_phone` / `allow_duplicate_email`.  Pass `existing` (from `list`) when creating
+        many, so the book is not re-read for each one.
         """
         payload = contact.to_rest()
+        if (not allow_duplicate_phone and contact.phones()) or (not allow_duplicate_email and contact.emails):
+            existing = self.list() if existing is None else existing
         if not allow_duplicate_phone and contact.phones():
-            existing = self.list()
             clash = {c.name() or c.id for p in contact.phones() for c in self.find_by_phone(p, existing)}
             if clash:
                 raise OutlookError(f"a number on this contact is already on: {sorted(clash)}")
+        if not allow_duplicate_email and contact.emails:
+            clash = {c.name() or c.id for e in contact.emails for c in self.find_by_email(e, existing)}
+            if clash:
+                raise OutlookError(f"an address on this contact is already on: {sorted(clash)}")
         made = rest_send(self.s, "POST", self.base, payload, self.token())
         if not made.get("Id"):
             raise OutlookError(f"contact POST returned no Id: {json.dumps(made)[:300]}")
@@ -509,6 +585,130 @@ class Contacts:
         """The contact groups (distribution lists) in one folder, each as Outlook's whole item with Members."""
         return self.get_items([i["ItemId"]["Id"] for i in self._find_items(folder_id)
                                if (i.get("ItemClass") or "").startswith("IPM.DistList")])
+
+    def find_group(self, name: str, folder_id: str | None = None) -> list[dict]:
+        """The groups in one folder whose name is `name`, case-insensitively.  More than one is possible."""
+        return [g for g in self.groups(folder_id) if _norm(g.get("DisplayName")).lower() == _norm(name).lower()]
+
+    def get_group(self, group_id: str) -> dict:
+        got = self.get_items([group_id])
+        if not got:
+            raise OutlookError(f"no group with id {group_id}")
+        return got[0]
+
+    def create_group(self, name: str, members, folder_id: str | None = None) -> dict:
+        """Create a contact group holding `members` (see `group_members`), read it back, and return it.
+
+        Refuses a name already used by a group in that folder.  If the stored group is not the one asked
+        for, it is deleted again and refused.
+        """
+        if not _norm(name):
+            raise OutlookError("a group needs a name")
+        if self.find_group(name, folder_id):
+            raise OutlookError(f"a group called {name!r} already exists; add to it with add_members")
+        want = group_members(members)
+        parent = ({"__type": "DistinguishedFolderId:#Exchange", "Id": "contacts"} if not folder_id else
+                  {"__type": "FolderId:#Exchange", "Id": folder_id})
+        made = self._owa("CreateItem", {
+            "Items": [{"__type": "DistributionList:#Exchange", "DisplayName": name,
+                       "Members": [_member_json(n, a) for n, a in want]}],
+            "SavedItemFolderId": {"__type": "TargetFolderId:#Exchange", "BaseFolderId": parent}})
+        gid = made[0]["Items"][0]["ItemId"]["Id"]
+        try:
+            stored = self.get_group(gid)
+            probs = member_differences(want, stored_members(stored))
+            if _norm(stored.get("DisplayName")) != _norm(name):
+                probs.append(f"name: asked {name!r}, stored {stored.get('DisplayName')!r}")
+        except Exception:
+            self.delete_group(gid)
+            raise
+        if probs:
+            self.delete_group(gid)
+            raise OutlookError("the server stored a different group than was asked for, so it was deleted "
+                               "again: " + "; ".join(probs))
+        return stored
+
+    def _set_members(self, group: dict, update: str, members: list[tuple[str, str]]) -> None:
+        ids = group["ItemId"]
+        self._owa("UpdateItem", {"ConflictResolution": "AlwaysOverwrite", "ItemChanges": [{
+            "__type": "ItemChange:#Exchange",
+            "ItemId": {"__type": "ItemId:#Exchange", "Id": ids["Id"], "ChangeKey": ids["ChangeKey"]},
+            "Updates": [{"__type": f"{update}:#Exchange",
+                         "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Members"},
+                         "Item": {"__type": "DistributionList:#Exchange",
+                                  "Members": [_member_json(n, a) for n, a in members]}}]}]})
+
+    def add_members(self, group_id: str, members) -> dict:
+        """Add `members` to a group, skipping addresses already in it; read back and verify the whole list."""
+        group = self.get_group(group_id)
+        have = stored_members(group)
+        new = [m for m in group_members(members) if m[1].lower() not in {a.lower() for _, a in have}]
+        if new:
+            self._set_members(group, "AppendToItemField", new)
+        stored = self.get_group(group_id)
+        probs = member_differences(have + new, stored_members(stored))
+        if probs:
+            raise OutlookError("the group did not store the members as sent: " + "; ".join(probs))
+        return stored
+
+    def remove_members(self, group_id: str, addresses: list[str]) -> dict:
+        """Remove members by address by rewriting the group's member list; read back and verify it.
+
+        Refuses a group holding any member that is not a plain name-and-address entry - one linked to a
+        contact card, a directory user, or another group - because rewriting the list stores every
+        member as a plain entry, which would quietly cut those links (or, for a nested group with no
+        address, store an empty member).
+        """
+        group = self.get_group(group_id)
+        linked = [(m.get("Mailbox") or {}) for m in group.get("Members") or []
+                  if (m.get("Mailbox") or {}).get("MailboxType") != "OneOff"
+                  or not (m.get("Mailbox") or {}).get("EmailAddress")]
+        if linked:
+            raise OutlookError(
+                "refusing to rewrite this group: removing a member rewrites the whole list, and these "
+                "members are linked rather than plain addresses, so the rewrite would change them: "
+                + ", ".join(f"{b.get('Name') or b.get('EmailAddress') or '?'} ({b.get('MailboxType')})"
+                            for b in linked) + ". Remove members from this group in Outlook itself.")
+        drop = {a.strip().lower() for a in addresses}
+        keep = [m for m in stored_members(group) if m[1].lower() not in drop]
+        if len(keep) == len(stored_members(group)):
+            return group
+        if not keep:
+            raise OutlookError("that would leave the group empty; delete the group instead")
+        self._set_members(group, "SetItemField", keep)
+        stored = self.get_group(group_id)
+        probs = member_differences(keep, stored_members(stored))
+        if probs:
+            raise OutlookError("the group did not store the member list as sent: " + "; ".join(probs))
+        return stored
+
+    def rename_group(self, group_id: str, name: str) -> dict:
+        """Rename a group, read it back, and return it.  Refuses a name another group in its folder has."""
+        if not _norm(name):
+            raise OutlookError("a group needs a name")
+        group = self.get_group(group_id)
+        folder = (group.get("ParentFolderId") or {}).get("Id")
+        if any(g["ItemId"]["Id"] != group_id for g in self.find_group(name, folder)):
+            raise OutlookError(f"a group called {name!r} already exists")
+        ids = group["ItemId"]
+        self._owa("UpdateItem", {"ConflictResolution": "AlwaysOverwrite", "ItemChanges": [{
+            "__type": "ItemChange:#Exchange",
+            "ItemId": {"__type": "ItemId:#Exchange", "Id": ids["Id"], "ChangeKey": ids["ChangeKey"]},
+            "Updates": [{"__type": "SetItemField:#Exchange",
+                         "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "DisplayName"},
+                         "Item": {"__type": "DistributionList:#Exchange", "DisplayName": name}}]}]})
+        stored = self.get_group(group_id)
+        if _norm(stored.get("DisplayName")) != _norm(name):
+            raise OutlookError(f"the group is still called {stored.get('DisplayName')!r}, not {name!r}")
+        probs = member_differences(stored_members(group), stored_members(stored))
+        if probs:
+            raise OutlookError("renaming changed the group's members: " + "; ".join(probs))
+        return stored
+
+    def delete_group(self, group_id: str) -> None:
+        """Delete one group.  Like a contact, it moves to Deleted Items."""
+        self._owa("DeleteItem", {"ItemIds": [{"__type": "ItemId:#Exchange", "Id": group_id}],
+                                 "DeleteType": "MoveToDeletedItems"})
 
     def ews_items(self, folder_id: str | None = None, change_keys: set | None = None) -> dict[str, dict]:
         """Outlook's own view of the contacts in one folder, keyed by ChangeKey - the one key REST shares.

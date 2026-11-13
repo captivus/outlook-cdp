@@ -133,6 +133,136 @@ def test_update_refuses_a_field_the_server_kept():
     _raises(lambda: _with_fake_patch(book, lambda: book.update("ID", nickname="")), "nickname")
 
 
+def test_group_members_take_contacts_pairs_and_bare_addresses():
+    got = contacts.group_members([_contact(), ("Sam Two", "sam@example.com"), "lee@example.com"])
+    assert got == [("Pat Q Example", "pat@example.com"), ("Sam Two", "sam@example.com"),
+                   ("lee@example.com", "lee@example.com")]
+
+
+def test_group_members_keep_a_shared_address_once():
+    got = contacts.group_members([("Joni", "home@example.com"), ("Scott", "HOME@example.com")])
+    assert got == [("Joni", "home@example.com")]
+
+
+def test_group_members_refuse_what_is_not_an_address():
+    _raises(lambda: contacts.group_members(["not an address"]), "not an email")
+    _raises(lambda: contacts.group_members([_contact(emails=[])]), "no email")
+
+
+def test_member_json_is_a_one_off_with_name_and_address():
+    m = contacts._member_json("Pat", "pat@example.com")["Mailbox"]
+    assert m["MailboxType"] == "OneOff" and m["Name"] == "Pat" and m["EmailAddress"] == "pat@example.com"
+    assert "ItemId" not in m
+
+
+def test_member_differences_name_what_the_server_changed():
+    want = [("Pat", "pat@example.com"), ("Sam", "sam@example.com")]
+    assert contacts.member_differences(want, [("Pat", "PAT@example.com"), ("Sam", "sam@example.com")]) == []
+    probs = contacts.member_differences(want, [("pat@example.com", "pat@example.com"), ("X", "x@example.com")])
+    assert any("missing sam@" in p for p in probs) and any("unexpected x@" in p for p in probs)
+    assert any("asked name 'Pat'" in p for p in probs)
+    assert contacts.member_differences(want, want + [("Sam", "sam@example.com")])[-1].startswith("the same")
+
+
+def test_stored_members_reads_a_group_item():
+    item = {"Members": [{"Mailbox": {"Name": "Pat", "EmailAddress": "pat@example.com", "MailboxType": "OneOff"}}]}
+    assert contacts.stored_members(item) == [("Pat", "pat@example.com")]
+    assert contacts.stored_members({}) == []
+
+
+class _GroupStore(contacts.Contacts):
+    """Contacts whose service.svc is a dict of groups, so the group write paths run without a browser.
+
+    `mangle` lets a test make the "server" store something other than what was sent.
+    """
+
+    def __init__(self, mangle=None):
+        self.items, self.n, self.mangle, self.calls = {}, 0, mangle, []
+
+    def _owa(self, action, body):
+        self.calls.append(action)
+        if action == "FindItem":
+            return [{"RootFolder": {"Items": [{"ItemId": {"Id": i}, "ItemClass": "IPM.DistList"}
+                                              for i in self.items]}}]
+        if action == "GetItem":
+            return [{"Items": [dict(self.items[x["Id"]]) for x in body["ItemIds"] if x["Id"] in self.items]}]
+        if action == "CreateItem":
+            self.n += 1
+            gid = f"G{self.n}"
+            it = body["Items"][0]
+            self.items[gid] = {"ItemId": {"Id": gid, "ChangeKey": "k"}, "DisplayName": it["DisplayName"],
+                               "Members": list(it["Members"])}
+            if self.mangle:
+                self.mangle(self.items[gid])
+            return [{"Items": [{"ItemId": {"Id": gid}}]}]
+        if action == "UpdateItem":
+            ch = body["ItemChanges"][0]
+            g = self.items[ch["ItemId"]["Id"]]
+            for u in ch["Updates"]:
+                kind, field, item = u["__type"].split(":")[0], u["Path"]["FieldURI"], u["Item"]
+                if field == "Members":
+                    g["Members"] = (g["Members"] if kind == "AppendToItemField" else []) + list(item["Members"])
+                else:
+                    g[field] = item[field]
+            return [{}]
+        if action == "DeleteItem":
+            assert body["DeleteType"] == "MoveToDeletedItems"
+            for x in body["ItemIds"]:
+                self.items.pop(x["Id"])
+            return [{}]
+        raise AssertionError(action)
+
+
+def _addrs(g):
+    return [a for _, a in contacts.stored_members(g)]
+
+
+def test_group_create_add_remove_rename_delete_round_trip():
+    book = _GroupStore()
+    g = book.create_group("Team", [("Pat", "pat@example.com"), "lee@example.com"])
+    gid = g["ItemId"]["Id"]
+    assert _addrs(g) == ["pat@example.com", "lee@example.com"]
+    g = book.add_members(gid, ["LEE@example.com", ("Sam", "sam@example.com")])   # lee already there
+    assert _addrs(g) == ["pat@example.com", "lee@example.com", "sam@example.com"]
+    g = book.remove_members(gid, ["lee@example.com"])
+    assert _addrs(g) == ["pat@example.com", "sam@example.com"]
+    g = book.rename_group(gid, "Team B")
+    assert g["DisplayName"] == "Team B" and _addrs(g) == ["pat@example.com", "sam@example.com"]
+    book.delete_group(gid)
+    assert book.items == {}
+
+
+def test_group_create_refuses_a_used_name_and_rename_refuses_one_too():
+    book = _GroupStore()
+    book.create_group("Team", ["a@example.com"])
+    other = book.create_group("Other", ["b@example.com"])["ItemId"]["Id"]
+    _raises(lambda: book.create_group("team", ["c@example.com"]), "already exists")
+    _raises(lambda: book.rename_group(other, "TEAM"), "already exists")
+    _raises(lambda: book.rename_group(other, "  "), "needs a name")
+
+
+def test_a_group_the_server_stored_wrongly_is_deleted_again():
+    book = _GroupStore(mangle=lambda g: g["Members"].pop())
+    _raises(lambda: book.create_group("Team", ["a@example.com", "b@example.com"]), "missing b@")
+    assert book.items == {} and book.calls[-1] == "DeleteItem"
+
+
+def test_remove_refuses_to_empty_a_group():
+    book = _GroupStore()
+    gid = book.create_group("Team", ["a@example.com"])["ItemId"]["Id"]
+    _raises(lambda: book.remove_members(gid, ["a@example.com"]), "empty")
+
+
+def test_remove_refuses_a_group_with_linked_members_rather_than_flatten_them():
+    book = _GroupStore()
+    gid = book.create_group("Team", ["a@example.com", "b@example.com"])["ItemId"]["Id"]
+    book.items[gid]["Members"].append({"Mailbox": {"Name": "Nested", "MailboxType": "PrivateDL",
+                                                   "ItemId": {"Id": "X"}}})
+    before = list(book.items[gid]["Members"])
+    _raises(lambda: book.remove_members(gid, ["a@example.com"]), "Nested (PrivateDL)")
+    assert book.items[gid]["Members"] == before and "UpdateItem" not in book.calls
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

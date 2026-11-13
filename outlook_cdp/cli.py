@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import urllib.parse
 
 from . import guards as G
 from .mail import Mailbox
-from .reading import Reader
+from .reading import Reader, html_to_text
 from .recipients import resolved_recipients
 from . import dedupe, dedupe_review
-from .contacts import Contact, Contacts
+from .contacts import Contact, Contacts, stored_members
 from .rules import Rule, Rules
 from .session import OutlookError, Session
 
@@ -111,19 +113,31 @@ def _main(argv=None) -> int:
     r.add_argument("--folder", default="inbox", help="folder that preview / apply look in")
 
     k = sub.add_parser("contacts", help="list, find, add, update, photograph, delete, back up, restore or "
-                                        "deduplicate contacts over REST")
+                                        "deduplicate contacts, and make contact groups (lists)")
     k.add_argument("action", choices=["list", "find", "add", "update", "photo", "delete", "backup", "restore",
-                                      "dedupe-plan", "dedupe-review", "dedupe-apply"])
+                                      "dedupe-plan", "dedupe-review", "dedupe-apply",
+                                      "groups", "group-create", "group-add", "group-remove", "group-rename",
+                                      "group-delete"])
     k.add_argument("--mailbox", default="", help="whose contacts; defaults to the tab URL's mailbox, and "
                                                 "'me' means the signed-in user")
     k.add_argument("--phone", default="", help="find: number to match, formatting ignored")
     k.add_argument("--name", default="", help="find: display-name substring")
+    k.add_argument("--email", default="", help="find: an address, matched whole and case-insensitively")
+    k.add_argument("--new-name", default="", help="group-rename: the group's new name")
     k.add_argument("--json", dest="json_file", default="",
                    help="add: one Contact's fields as a JSON object, or a list of them; "
                         "update: the fields to change, \"\" to clear")
     k.add_argument("--allow-duplicate-phone", action="store_true",
                    help="add: create even when a number is already on another contact")
-    k.add_argument("--id", default="", help="update, photo, delete: contact id")
+    k.add_argument("--allow-duplicate-email", action="store_true",
+                   help="add: create even when an address is already on another contact")
+    k.add_argument("--group", default="", help="group-create: the new group's name; group-add, group-remove, "
+                                               "group-rename, group-delete: an existing group's name, unless --id is given")
+    k.add_argument("--member", action="append", default=[], metavar="ADDRESS",
+                   help="group-create, group-add, group-remove: an address, or 'Name <address>' (repeatable)")
+    k.add_argument("--members-from-contacts", action="store_true",
+                   help="group-create, group-add: name each --member as the contact holding that address")
+    k.add_argument("--id", default="", help="update, photo, delete: contact id; group-*: group id")
     k.add_argument("--photo", default="", help="photo: a JPEG, PNG or GIF file to set as the picture")
     k.add_argument("--out", default="", help="backup: directory for the backup file; dedupe-plan: plan file; "
                                          "dedupe-review: HTML file")
@@ -349,12 +363,15 @@ def contacts_cmd(a, s: Session) -> int:
         if a.action == "list":
             print(json.dumps([show(c) for c in book.list()], indent=1))
             return 0
+        if a.action.startswith("group"):
+            return group_cmd(a, book)
         if a.action == "find":
-            if not (a.phone or a.name):
-                print("find needs --phone or --name", file=sys.stderr)
+            if not (a.phone or a.name or a.email):
+                print("find needs --phone, --name or --email", file=sys.stderr)
                 return 2
             everyone = book.list()
-            hits = book.find_by_phone(a.phone, everyone) if a.phone else book.find_by_name(a.name, everyone)
+            hits = (book.find_by_phone(a.phone, everyone) if a.phone else
+                    book.find_by_email(a.email, everyone) if a.email else book.find_by_name(a.name, everyone))
             print(json.dumps([show(c) for c in hits], indent=1))
             return 0
         if a.action == "delete":
@@ -370,7 +387,8 @@ def contacts_cmd(a, s: Session) -> int:
                 return 2
             kind = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif"}
             ct = kind.get(a.photo.rsplit(".", 1)[-1].lower(), "")
-            print(json.dumps(book.set_photo(a.id, open(a.photo, "rb").read(), ct)))
+            meta = book.set_photo(a.id, open(a.photo, "rb").read(), ct)
+            print(json.dumps({"photo_set": a.id, "width": meta.get("Width"), "height": meta.get("Height")}))
             return 0
         if not a.json_file:
             print(f"{a.action} needs --json", file=sys.stderr)
@@ -386,7 +404,8 @@ def contacts_cmd(a, s: Session) -> int:
         made, failed = [], 0
         for fields in raw if isinstance(raw, list) else [raw]:
             try:
-                c = book.create(Contact(**fields), allow_duplicate_phone=a.allow_duplicate_phone)
+                c = book.create(Contact(**fields), allow_duplicate_phone=a.allow_duplicate_phone,
+                                allow_duplicate_email=a.allow_duplicate_email)
                 made.append({"created": c.name(), "id": c.id})
             except (OutlookError, TypeError) as e:
                 failed += 1
@@ -397,6 +416,59 @@ def contacts_cmd(a, s: Session) -> int:
     except OutlookError as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3
+
+
+def group_cmd(a, book: Contacts) -> int:
+    show = lambda g: {"id": g["ItemId"]["Id"], "name": g.get("DisplayName"),   # noqa: E731
+                      "members": [f"{n} <{addr}>" for n, addr in stored_members(g)]}
+    if a.action == "groups":
+        print(json.dumps([show(g) for g in book.groups()], indent=1))
+        return 0
+    members = []
+    for m in a.member:
+        got = re.fullmatch(r"\s*(.*?)\s*<([^>]+)>\s*", m)
+        members.append((got.group(1), got.group(2)) if got else m.strip())
+    if a.members_from_contacts:
+        everyone = book.list()
+        named = []
+        for m in members:
+            addr = m if isinstance(m, str) else m[1]
+            hits = book.find_by_email(addr, everyone)
+            named.append((hits[0].name(), addr) if len(hits) == 1 else m)
+        members = named
+    if a.action == "group-create":
+        if not (a.group and members):
+            print("group-create needs --group and at least one --member", file=sys.stderr)
+            return 2
+        print(json.dumps(show(book.create_group(a.group, members)), indent=1))
+        return 0
+    gid = a.id
+    if not gid:
+        found = book.find_group(a.group) if a.group else []
+        if len(found) != 1:
+            print(f"{a.action} needs --id, or a --group name that matches exactly one group "
+                  f"({len(found)} matched)", file=sys.stderr)
+            return 2
+        gid = found[0]["ItemId"]["Id"]
+    if a.action == "group-rename":
+        if not a.new_name:
+            print("group-rename needs --new-name", file=sys.stderr)
+            return 2
+        print(json.dumps(show(book.rename_group(gid, a.new_name)), indent=1))
+        return 0
+    if a.action == "group-delete":
+        book.delete_group(gid)
+        print(json.dumps({"deleted": gid}))
+        return 0
+    if not members:
+        print(f"{a.action} needs at least one --member", file=sys.stderr)
+        return 2
+    if a.action == "group-add":
+        print(json.dumps(show(book.add_members(gid, members)), indent=1))
+    else:
+        print(json.dumps(show(book.remove_members(gid, [m if isinstance(m, str) else m[1] for m in members])),
+                         indent=1))
+    return 0
 
 
 if __name__ == "__main__":
