@@ -43,6 +43,7 @@ from .attachments import (Attachment, access_token, auth_header, resolve_mailbox
                           messages_with_attachments, open_message_attachments,
                           open_conversation_messages, download, download_all, verify_file)
 from .rules import Rule, Rules, rest_send                          # noqa: F401
+from .moving import Mover, MoveResult                              # noqa: F401
 from .contacts import (Contact, Contacts, phone_digits, group_members,   # noqa: F401
                        stored_members, member_differences)
 from . import guards, dedupe, dedupe_review                                       # noqa: F401
@@ -57,7 +58,7 @@ __all__ = ["Session", "Mailbox", "OutlookError", "OUTLOOK_HOSTS", "guards", "ded
            "Attachment", "access_token", "auth_header", "resolve_mailbox",
            "list_attachments", "messages_with_attachments",
            "open_message_attachments", "open_conversation_messages", "download",
-           "download_all", "verify_file", "Rule", "Rules", "rest_send",
+           "download_all", "verify_file", "Rule", "Rules", "rest_send", "Mover", "MoveResult",
            "Contact", "Contacts", "phone_digits", "group_members", "stored_members",
            "member_differences"]
 __version__ = "0.3.0"

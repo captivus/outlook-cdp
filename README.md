@@ -141,6 +141,20 @@ outlook-cdp --instance my-instance search "some phrase" --mailbox me --top 50
 outlook-cdp --instance my-instance search --from ci@example.com --folder archive --top 1000 --summary
 ```
 
+Moving chosen messages to Deleted Items (a move, not a permanent delete) lists what it would move
+unless given `--yes`, and needs `--from` or `--ids` so it cannot sweep a folder. It searches every
+folder, Junk Email included, skips what is already in the destination, keeps each message's read
+state, does not report anything as "Not junk", and reads each moved message back from its new folder:
+
+```
+outlook-cdp --instance my-instance --target ID move --from test@example.com --received-after 2026-11-12
+outlook-cdp --instance my-instance --target ID move --from test@example.com --received-after 2026-11-12 --yes
+outlook-cdp --instance my-instance move --ids ID1 ID2 --yes          # exactly the ids a dry run listed
+```
+
+`--folder`, `--subject-contains` and `--received-before` narrow it further; `--to` picks another folder;
+`--max` (default 50) caps one run. In Python: `Mover(session).find(...)`, then `.move(found)`.
+
 Contacts are REST as well — created, read back and checked, without the People UI:
 
 ```python

@@ -96,10 +96,30 @@ def _main(argv=None) -> int:
     q = sub.add_parser("search", help="search messages over REST; changes nothing, marks nothing read")
     q.add_argument("query", nargs="?", default="", help="$search text; omit to list with --from only")
     q.add_argument("--mailbox", default="", help="defaults to the tab URL's; 'me' is the signed-in user")
-    q.add_argument("--folder", default="", help="limit to one folder (well-known name or id)")
+    q.add_argument("--folder", default="", help="limit to one folder (well-known name or id); "
+                                              "default: every folder")
     q.add_argument("--from", dest="from_address", default="", help="exact sender address")
     q.add_argument("--top", type=int, default=25)
     q.add_argument("--summary", action="store_true", help="count by sender, subject and folder instead")
+
+    mv = sub.add_parser("move", help="move chosen messages to Deleted Items (or another folder) over REST; "
+                                     "lists them only, unless --yes")
+    mv.add_argument("--mailbox", default="", help="defaults to the tab URL's; 'me' is the signed-in user")
+    mv.add_argument("--to", dest="destination", default="deleteditems",
+                    help="destination: well-known folder name or folder id (default deleteditems)")
+    mv.add_argument("--from", dest="from_addresses", action="append", default=[], metavar="ADDR",
+                    help="exact sender address (repeatable; any of them)")
+    mv.add_argument("--ids", nargs="+", default=[], metavar="ID", help="exact message ids, from a dry run")
+    mv.add_argument("--folder", action="append", default=[], metavar="FOLDER",
+                    help="only messages in this folder (repeatable); default: every folder")
+    mv.add_argument("--subject-contains", action="append", default=[], metavar="TEXT",
+                    help="case-insensitive subject substring (repeatable; any of them)")
+    mv.add_argument("--received-after", default=None, metavar="DATE",
+                    help="on or after this UTC date or ISO time, e.g. 2026-11-12")
+    mv.add_argument("--received-before", default=None, metavar="DATE",
+                    help="before this UTC date or ISO time")
+    mv.add_argument("--max", type=int, default=50, help="refuse to move more than this many (default 50)")
+    mv.add_argument("--yes", action="store_true", help="actually move; without it, only list what would move")
 
     r = sub.add_parser("rules", help="list, preview, add, apply or delete inbox rules over REST")
     r.add_argument("action", choices=["list", "preview", "add", "apply", "delete"])
@@ -164,6 +184,8 @@ def _main(argv=None) -> int:
         return contacts_cmd(a, s)
     if a.cmd == "search":
         return search_cmd(a, s)
+    if a.cmd == "move":
+        return move_cmd(a, s)
     m = Mailbox(s)
 
     if a.cmd == "status":
@@ -231,11 +253,43 @@ def _main(argv=None) -> int:
     return 0
 
 
+def move_cmd(a, s: Session) -> int:
+    from .moving import Mover, describe, dumps
+    if not (a.from_addresses or a.ids):
+        print("REFUSED: move needs --from or --ids, so it cannot sweep a whole folder", file=sys.stderr)
+        return 2
+    mailbox = Rules.signed_in_address(s) if a.mailbox == "me" else (a.mailbox or None)
+    try:
+        mv = Mover(s, mailbox)
+        plan = mv.find(from_addresses=a.from_addresses, ids=a.ids, folders=a.folder,
+                       subject_contains=a.subject_contains, received_after=a.received_after,
+                       received_before=a.received_before, destination=a.destination)
+        if not a.yes:
+            print(dumps({"mailbox": urllib.parse.unquote(mv.base.rsplit("/", 1)[1]), "would_move": len(plan),
+                         "to": a.destination, "messages": [describe(m) for m in plan]}))
+            if len(plan) > a.max:
+                print(f"note: {len(plan)} is over --max {a.max}; --yes would refuse", file=sys.stderr)
+            return 0
+        results = mv.move(plan, a.destination, max_messages=a.max)
+    except OutlookError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 3
+    print(dumps({"moved": sum(r.ok for r in results), "failed": sum(not r.ok for r in results),
+                 "results": [vars(r) for r in results]}))
+    return 0 if all(r.ok for r in results) else 1
+
+
 def search_cmd(a, s: Session) -> int:
     mailbox = Rules.signed_in_address(s) if a.mailbox == "me" else (a.mailbox or None)
     try:
         r = Reader(s, wake=False, mailbox=mailbox)
-        if a.from_address:
+        if a.from_address and not a.folder:
+            # Exact sender across every folder: Junk Email and Deleted Items too, not just the Inbox.
+            from .moving import Mover
+            mv = Mover(s, mailbox)
+            hits = mv.find(from_addresses=[a.from_address], destination=None,
+                           subject_contains=[a.query] if a.query else ())[:max(a.top, 1)]
+        elif a.from_address:
             # Exact sender, every match: a sender filter needs no $search and is not capped by it.
             sender = Rules(s, mailbox or r.base.rsplit("/", 1)[1])
             hits = sender.preview(Rule("search", from_addresses=[a.from_address]),
