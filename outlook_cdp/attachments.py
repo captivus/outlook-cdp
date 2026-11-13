@@ -130,9 +130,12 @@ _TOKEN_JS = """(async()=>{
   const ck=document.cookie.split('; ').find(c=>c.startsWith('msal.cache.encryption='));
   if(ck){try{const kv=JSON.parse(decodeURIComponent(ck.split('=').slice(1).join('=')));
     base=await crypto.subtle.importKey('raw',b64u(kv.key),'HKDF',false,['deriveKey']);}catch(e){}}
-  let best=null;
+  const acct=%s;
+  let best=null; const seen={};
   for(const k of Object.keys(localStorage)){
     if(!/\\|accesstoken\\|/.test(k)||!k.toLowerCase().includes(want)) continue;
+    const home=(k.split('|')[1]||'').toLowerCase();
+    if(acct && home!==acct) continue;
     let v; try{v=JSON.parse(localStorage.getItem(k))}catch(e){continue}
     let secret=v&&v.secret, exp=parseInt((v&&v.expiresOn)||'0',10)||0;
     if(!secret && v && v.nonce && v.data && base){
@@ -146,9 +149,32 @@ _TOKEN_JS = """(async()=>{
       }catch(e){continue}
     }
     if(!secret) continue;
-    if(!best||exp>best.expires) best={secret:secret,expires:exp};
+    if(!seen[home]||exp>seen[home].expires) seen[home]={secret:secret,expires:exp};
   }
-  return best})()"""
+  const homes=Object.keys(seen);
+  if(homes.length>1) return {ambiguous:homes};
+  return homes.length?seen[homes[0]]:null})()"""
+
+#: The account *this tab* is signed in to.  localStorage, where MSAL keeps its tokens, is shared by
+#: every tab on the origin, so with two accounts open it holds both accounts' tokens side by side, and
+#: picking by expiry alone hands one tab the other's token.  sessionStorage is per tab, and Outlook
+#: keeps a Loki token there for the tab's own account; its ``oid.tid`` is MSAL's home-account id, and
+#: its ``preferred_username`` is the sign-in address.  Only claims are read; the token is not returned.
+_TAB_ACCOUNT_JS = """(()=>{try{
+  const t=sessionStorage.getItem('LokiAuthToken'); if(!t) return null;
+  const p=t.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+  const c=JSON.parse(atob(p+'==='.slice((p.length+3)%4)));
+  if(!c.oid||!c.tid) return null;
+  return {home:(c.oid+'.'+c.tid).toLowerCase(), address:(c.preferred_username||c.upn||'').toLowerCase(),
+          name:c.name||''}}catch(e){return null}})()"""
+
+
+def tab_account(session: Session) -> dict | None:
+    """``{home, address, name}`` for the account this tab is signed in to, or None if the page does
+    not say.  `home` is MSAL's home-account id (``oid.tid``); `address` is the sign-in name, which on
+    a work account is the UPN and may differ from the primary SMTP address."""
+    got = session.js(_TAB_ACCOUNT_JS)
+    return got if isinstance(got, dict) and got.get("home") else None
 
 
 def access_token(session: Session, scope: str = REST_SCOPE, min_ttl: float = 30.0) -> str:
@@ -160,7 +186,14 @@ def access_token(session: Session, scope: str = REST_SCOPE, min_ttl: float = 30.
     is alive, so a token that is expired here means the tab has been idle rather than that anything is
     broken; touching the mailbox in the UI, or simply waiting for Outlook's own next poll, replaces it.
     """
-    got = session.js(_TOKEN_JS % json.dumps(scope), await_promise=True)
+    acct = tab_account(session)
+    got = session.js(_TOKEN_JS % (json.dumps(scope), json.dumps(acct and acct["home"])),
+                     await_promise=True)
+    if got and got.get("ambiguous"):
+        raise OutlookError(
+            f"the page's MSAL cache holds {scope!r} tokens for {len(got['ambiguous'])} accounts "
+            f"({', '.join(got['ambiguous'])}) and this tab does not say which one it is signed in to, "
+            f"so no token is borrowed rather than risk reading another account's mail.")
     if not got:
         raise OutlookError(
             f"no access token for scope {scope!r} in the page's MSAL cache. Either the tab is not "
@@ -196,12 +229,41 @@ def resolve_mailbox(session: Session, mailbox: str | None = None) -> str:
     mb = (mailbox or session.mailbox_identity() or "").strip().lower()
     if mb:
         return mb
-    mb = (rest_get(session, "/api/v2.0/me").get("EmailAddress") or "").strip().lower()
+    mb = signed_in_address(session)
     if not mb:
         raise OutlookError(
-            "cannot tell which mailbox this tab is showing: its URL names none and /api/v2.0/me "
-            "returned no address. Pass mailbox= explicitly.")
+            "cannot tell which mailbox this tab is showing: its URL names none, /api/v2.0/me "
+            "returned no address, and the page does not name its account. Pass mailbox= explicitly.")
     return mb
+
+
+#: Transient refusals of ``/api/v2.0/me``.  ``MailboxInfoStale`` (503) is Exchange saying its cached
+#: view of the mailbox is being rebuilt; it clears on its own, usually within seconds.
+_STALE = ("MailboxInfoStale", " 503 ")
+
+
+def signed_in_address(session: Session, attempts: int = 3, delay: float = 1.5) -> str:
+    """The signed-in user's primary address, lower-cased - which is not necessarily the mailbox on
+    screen (see `resolve_mailbox`).
+
+    Asks ``/api/v2.0/me`` first, since it answers with the primary SMTP address, retrying the
+    transient 503 ``MailboxInfoStale``.  If that keeps failing, falls back to the sign-in name of the
+    tab's own account, which the REST API accepts in ``/users/{address}`` just the same.
+    """
+    err: OutlookError | None = None
+    for i in range(attempts):
+        try:
+            return (rest_get(session, "/api/v2.0/me").get("EmailAddress") or "").strip().lower()
+        except OutlookError as e:
+            err = e
+            if not any(m in str(e) for m in _STALE):
+                break
+            if i + 1 < attempts:
+                time.sleep(delay * (i + 1))
+    acct = tab_account(session)
+    if acct and acct.get("address"):
+        return acct["address"]
+    raise err
 
 
 def mailbox_base(session: Session, mailbox: str | None = None) -> str:
@@ -235,9 +297,15 @@ def rest_get(session: Session, path: str, token: str | None = None) -> dict:
     if out.get("status") != 200:
         body = out.get("body") or {}
         err = (body.get("error") or {}) if isinstance(body, dict) else {}
+        hint = ""
+        if err.get("code") == "ErrorInvalidUser":
+            acct = tab_account(session)
+            hint = (" - the address may be an alias, or a mailbox this tab's account cannot open"
+                    + (f"; this tab is signed in as {acct['address']}" if acct else "")
+                    + ". Omit the mailbox to use the signed-in one.")
         raise OutlookError(
             f"REST GET {path.split('?')[0]} returned {out.get('status')} "
-            f"{err.get('code', '')} {err.get('message', out.get('error', ''))}"[:400])
+            f"{err.get('code', '')} {err.get('message', out.get('error', ''))}"[:400] + hint)
     return out.get("body") or {}
 
 

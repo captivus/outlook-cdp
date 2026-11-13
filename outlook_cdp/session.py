@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import time
+import urllib.parse
 
 #: Hosts Outlook on the web has been served from.  Microsoft moved from outlook.office.com to
 #: outlook.cloud.microsoft mid-2026 and both still answer, so the host is resolved at runtime from the
@@ -20,6 +21,11 @@ OUTLOOK_HOSTS = ("outlook.cloud.microsoft", "outlook.office.com", "outlook.live.
 
 class OutlookError(RuntimeError):
     """Anything that means the page is not in the state the caller assumed."""
+
+
+def _describe(tabs: list[dict]) -> str:
+    return "\n".join(f"  {t.get('id', '?')}  {t.get('url', '')}  {t.get('title', '')!r}"
+                     for t in tabs) or "  (none)"
 
 
 class Session:
@@ -33,37 +39,85 @@ class Session:
     transitions.
     """
 
-    def __init__(self, instance: str, host: str | None = None, timeout: float = 120.0):
+    def __init__(self, instance: str, host: str | None = None, timeout: float = 120.0,
+                 target: str | None = None):
+        """`target` is a chrome-agent target id (or a unique prefix of one, as `chrome-agent status`
+        prints it).  It is only needed when the instance holds more than one Outlook tab, which it
+        does whenever two accounts are open side by side; then every tab sits on the same host and
+        the same bare ``/mail/`` URL, so nothing but the id can tell them apart."""
         self.instance = instance
         self.timeout = timeout
         self._host = host
+        self._target = target
 
     # ---------------------------------------------------------------- plumbing
+
+    def targets(self) -> list[dict]:
+        """Every tab in the instance, as chrome-agent's ``status`` lists them (id, url, title...)."""
+        r = subprocess.run(["chrome-agent", "status", self.instance],
+                           capture_output=True, text=True, timeout=self.timeout)
+        try:
+            listing = json.loads(r.stdout)
+        except ValueError:
+            raise OutlookError(f"chrome-agent status {self.instance!r} returned no JSON.\n"
+                               f"stdout: {r.stdout[:400]}\nstderr: {r.stderr[:400]}")
+        for inst in listing if isinstance(listing, list) else [listing]:
+            if inst.get("name") == self.instance:
+                return inst.get("targets") or []
+        raise OutlookError(f"no chrome-agent instance named {self.instance!r}")
+
+    def outlook_tabs(self) -> list[dict]:
+        """The instance's Outlook tabs, narrowed to `host` when one was given."""
+        hosts = (self._host,) if self._host else OUTLOOK_HOSTS
+        return [t for t in self.targets()
+                if any(urllib.parse.urlsplit(t.get("url", "")).hostname == h for h in hosts)]
+
+    def tab(self) -> dict:
+        """This session's tab, as chrome-agent lists it.
+
+        Read afresh every call, since the tab's URL changes as Outlook navigates; only its id is
+        fixed.  With no `target` given there must be exactly one Outlook tab, and the first call pins
+        to it by id.  Picking "the first match" instead would quietly drive the wrong account."""
+        if self._target:
+            want = self._target.upper()
+            hits = [t for t in self.targets()
+                    if str(t.get("full_id", t.get("id", ""))).upper().startswith(want)]
+            if len(hits) != 1:
+                raise OutlookError(
+                    f"target {self._target!r} matches {len(hits)} tabs in chrome-agent instance "
+                    f"{self.instance!r}. Outlook tabs are:\n" + _describe(self.outlook_tabs()))
+            return hits[0]
+        tabs = self.outlook_tabs()
+        if not tabs:
+            raise OutlookError(
+                f"no Outlook tab in chrome-agent instance {self.instance!r}. Tabs are:\n"
+                + _describe(self.targets()))
+        if len(tabs) > 1:
+            raise OutlookError(
+                f"chrome-agent instance {self.instance!r} has {len(tabs)} Outlook tabs; choose one "
+                f"with --target ID (Session(target=ID)):\n" + _describe(tabs))
+        self._target = tabs[0].get("full_id") or tabs[0]["id"]
+        return tabs[0]
+
+    @property
+    def target(self) -> str:
+        """The chrome-agent target id of this session's tab."""
+        t = self.tab()
+        return t.get("full_id") or t["id"]
 
     @property
     def host(self) -> str:
         if self._host is None:
-            r = subprocess.run(["chrome-agent", "status", self.instance],
-                               capture_output=True, text=True, timeout=self.timeout)
-            listing = r.stdout + r.stderr
-            for cand in OUTLOOK_HOSTS:
-                if cand in listing:
-                    self._host = cand
-                    break
-            else:
-                raise OutlookError(
-                    f"no Outlook tab in chrome-agent instance {self.instance!r}. Targets were:\n"
-                    + listing[:800])
+            host = urllib.parse.urlsplit(self.tab().get("url", "")).hostname or ""
+            if host not in OUTLOOK_HOSTS:
+                raise OutlookError(f"target {self._target!r} is not an Outlook tab: "
+                                   f"{self.tab().get('url', '')}")
+            self._host = host
         return self._host
 
     def tab_url(self) -> str:
         """The Outlook tab's own URL, from chrome-agent's target list."""
-        r = subprocess.run(["chrome-agent", "status", self.instance],
-                           capture_output=True, text=True, timeout=self.timeout)
-        for line in (r.stdout + r.stderr).splitlines():
-            if '"url"' in line and self.host in line:
-                return line.split('"')[3] if line.count('"') >= 4 else line.strip()
-        return ""
+        return self.tab().get("url", "")
 
     def mailbox_identity(self) -> str | None:
         """The mailbox this tab is scoped to, read from its URL.
@@ -78,7 +132,8 @@ class Session:
 
     def cdp(self, method: str, params: dict | None = None):
         r = subprocess.run(
-            ["chrome-agent", self.instance, "--url", self.host, method, json.dumps(params or {})],
+            ["chrome-agent", self.instance, "--target-id", self._target or self.target, method,
+             json.dumps(params or {})],
             capture_output=True, text=True, timeout=self.timeout)
         try:
             return json.loads(r.stdout)

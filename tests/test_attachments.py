@@ -19,13 +19,16 @@ from outlook_cdp.session import OutlookError  # noqa: E402
 class FakeSession:
     """Answers `js` from a queue and records what it was asked, so no CDP is involved."""
 
-    def __init__(self, answers=(), mailbox="office@example.com", url=""):
+    def __init__(self, answers=(), mailbox="office@example.com", url="", account=None):
         self.answers = list(answers)
         self._mailbox = mailbox
         self._url = url
+        self._account = account
         self.asked = []
 
     def js(self, expression, await_promise=False):
+        if expression == A._TAB_ACCOUNT_JS:      # the tab's own account: answered apart from the queue
+            return self._account
         self.asked.append(expression)
         return self.answers.pop(0) if self.answers else None
 
@@ -243,6 +246,53 @@ def test_messages_with_attachments_sorts_server_side_and_filters_here():
     sent = s.asked[0]
     assert "$orderby=ReceivedDateTime%20desc" in sent
     assert "HasAttachments%20eq" not in sent
+
+
+# ------------------------------------------------------------------ several accounts in one browser
+
+_ACCT = {"home": "oid-1.tid-1", "address": "me@example.com", "name": "Me"}
+
+
+def test_access_token_is_scoped_to_the_tabs_own_account():
+    # localStorage is shared by every tab on the origin, so with two accounts open it holds both
+    # accounts' tokens. The tab's account (from per-tab sessionStorage) must narrow the choice.
+    s = FakeSession([_token(3600)], account=_ACCT)
+    A.access_token(s)
+    assert '"oid-1.tid-1"' in s.asked[0]
+
+
+def test_access_token_refuses_to_guess_between_accounts():
+    s = FakeSession([{"ambiguous": ["a.t", "b.t"]}])
+    with raises(OutlookError, "2 accounts"):
+        A.access_token(s)
+
+
+def test_signed_in_address_retries_a_stale_mailbox():
+    stale = {"status": 503, "body": {"error": {"code": "MailboxInfoStale", "message": "stale"}}}
+    s = FakeSession([_token(3600), stale, _token(3600), {"status": 200, "body": {"EmailAddress": "Me@X.com"}}])
+    assert A.signed_in_address(s, delay=0) == "me@x.com"
+
+
+def test_signed_in_address_falls_back_to_the_tabs_account_when_me_stays_stale():
+    stale = {"status": 503, "body": {"error": {"code": "MailboxInfoStale", "message": "stale"}}}
+    s = FakeSession([_token(3600), stale] * 3, account=_ACCT)
+    assert A.signed_in_address(s, delay=0) == "me@example.com"
+
+
+def test_signed_in_address_does_not_retry_a_real_refusal():
+    denied = {"status": 403, "body": {"error": {"code": "ErrorAccessDenied", "message": "no"}}}
+    s = FakeSession([_token(3600), denied, _token(3600), denied])
+    with raises(OutlookError, "ErrorAccessDenied"):
+        A.signed_in_address(s, delay=0)
+    assert len(s.answers) == 2
+
+
+def test_invalid_user_names_the_tabs_account():
+    s = FakeSession([{"status": 404, "body": {"error": {"code": "ErrorInvalidUser",
+                                                        "message": "The requested user is invalid."}}}],
+                    account=_ACCT)
+    with raises(OutlookError, "signed in as me@example.com"):
+        A.rest_get(s, "/api/v2.0/users/x%40y/messages", token="jwt")
 
 
 if __name__ == "__main__":

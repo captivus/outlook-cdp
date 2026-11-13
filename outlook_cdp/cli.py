@@ -45,9 +45,20 @@ def build_guards(a) -> list:
 
 
 def main(argv=None) -> int:
+    try:
+        return _main(argv)
+    except OutlookError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 3
+
+
+def _main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="outlook-cdp", description=__doc__)
     p.add_argument("--instance", required=True, help="chrome-agent instance holding the Outlook tab")
     p.add_argument("--host", default=None, help="override the Outlook host instead of resolving it")
+    p.add_argument("--target", "--tab", default=None, metavar="ID",
+                   help="chrome-agent target id of the Outlook tab; needed when the instance has more "
+                        "than one (see `chrome-agent status INSTANCE`)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("compose", help="compose a new message or a reply, verify it, optionally send")
@@ -129,7 +140,7 @@ def main(argv=None) -> int:
                    help="dedupe-apply: actually delete; without it, only report what would be deleted")
 
     a = p.parse_args(argv)
-    s = Session(a.instance, host=a.host)
+    s = Session(a.instance, host=a.host, target=a.target)
     if a.cmd == "rules":
         return rules_cmd(a, s)
     if a.cmd == "contacts":
@@ -139,7 +150,7 @@ def main(argv=None) -> int:
     m = Mailbox(s)
 
     if a.cmd == "status":
-        print(json.dumps({"host": s.host, "compose_open": m.compose_open(),
+        print(json.dumps({"host": s.host, "target": s.target, "compose_open": m.compose_open(),
                           "from": m.from_label()}, indent=1))
         return 0
     if a.cmd == "discard":

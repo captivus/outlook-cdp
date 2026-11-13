@@ -37,7 +37,7 @@ import json
 import urllib.parse
 from dataclasses import dataclass, field
 
-from .attachments import auth_header, rest_get, resolve_mailbox
+from .attachments import auth_header, rest_get, resolve_mailbox, signed_in_address
 from .reading import Reader, Row
 from .session import OutlookError, Session
 
@@ -209,7 +209,7 @@ class Rules:
     @staticmethod
     def signed_in_address(session: Session) -> str:
         """The signed-in user's primary address - which is not necessarily the mailbox on screen."""
-        return (rest_get(session, "/api/v2.0/me").get("EmailAddress") or "").lower()
+        return signed_in_address(session)
 
     # ------------------------------------------------------------------ plumbing
 
