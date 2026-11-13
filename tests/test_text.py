@@ -58,6 +58,17 @@ def test_normalise_handles_none():
     assert normalise(None) == ""
 
 
+def test_body_matches_intended_ignore_whitespace_for_html_tables():
+    """An HTML table pastes as cells joined by tabs/newlines; the source text has none of them."""
+    from outlook_cdp import guards
+    from outlook_cdp.reading import html_to_text
+    h = "<p><b>Top</b> line</p><table><tr><td>A&amp;B</td><td>2</td></tr></table>"
+    pane = "Top line\nA&B\t2\n"
+    d = guards.Draft(intended_body=html_to_text(h), body=pane)
+    assert guards.BodyMatchesIntended(ignore_whitespace=True)(d) == []
+    assert guards.BodyMatchesIntended(ignore_whitespace=True)(guards.Draft(intended_body=html_to_text(h), body="Top line A&B")) != []
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

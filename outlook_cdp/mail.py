@@ -186,7 +186,17 @@ class Mailbox:
         top instead, which leaves Outlook's auto-inserted signature sitting between the new text and the
         quote; `drop_signature` removes that one node (`div#Signature`) rather than wiping the body.
         """
-        body_html = to_html(text)
+        self._paste_html(to_html(text), replace, drop_signature)
+
+    def set_body_html(self, body_html: str, replace: bool = True, drop_signature: bool = False) -> None:
+        """Paste ready-made HTML (tables, bold, lists) as the body.  Outlook keeps inline styles;
+        <style> blocks and classes are dropped, so style elements inline.  Verify with
+        `snapshot(intended_body=reading.html_to_text(body_html))` and
+        `guards.BodyMatchesIntended(ignore_whitespace=True)` - table cells render with tabs and
+        newlines the source doesn't have.  `replace` and `drop_signature` are as for `set_body`."""
+        self._paste_html(body_html, replace, drop_signature)
+
+    def _paste_html(self, body_html: str, replace: bool, drop_signature: bool = False) -> None:
         self.s.js("""(()=>{const el=document.querySelector('%s');el.focus();
           const r=document.createRange();r.selectNodeContents(el);
           const s=getSelection();s.removeAllRanges();s.addRange(r);

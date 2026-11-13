@@ -58,6 +58,12 @@ outlook-cdp --instance my-instance recipients     # what the open draft's chips 
 outlook-cdp --instance my-instance discard
 ```
 
+A body with tables, bold or lists goes in as HTML: `--html` with an HTML `--body-file`, or
+`m.set_body_html(html)` in Python. Outlook keeps inline styles but drops `<style>` blocks and classes, so
+style elements inline. The body guard then compares the HTML's text with whitespace ignored
+(`guards.BodyMatchesIntended(ignore_whitespace=True)`), because table cells render with tabs and line
+breaks the source does not have.
+
 If the instance has more than one Outlook tab (two accounts open side by side), every command
 refuses and lists the tabs.  Pick one with `--target ID` (`Session(instance, target=ID)` in Python),
 where `ID` is the tab's id from that list or from `chrome-agent status`.  Those tabs share one token

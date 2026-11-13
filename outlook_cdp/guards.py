@@ -231,8 +231,14 @@ class BodyMatchesIntended(Guard):
     """
     name = "body matches intended"
 
+    def __init__(self, ignore_whitespace: bool = False):
+        # True for HTML bodies: table cells and list items render with whitespace the source lacks
+        self.ignore_whitespace = ignore_whitespace
+
     def __call__(self, draft: Draft) -> list[str]:
         want, got = normalise(draft.intended_body), normalise(draft.body)
+        if self.ignore_whitespace:
+            want, got = "".join(want.split()), "".join(got.split())
         if not want or want in got:
             return []
         i = next((k for k in range(min(len(want), len(got))) if want[k] != got[k]),

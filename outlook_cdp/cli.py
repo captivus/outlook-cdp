@@ -38,7 +38,7 @@ def build_guards(a) -> list:
     gs.append(G.IntendedRecipientsPresent(
         dict(x.split("=", 1) for x in a.alias) if a.alias else None))
     gs.append(G.SubjectMatchesIntended())
-    gs.append(G.BodyMatchesIntended())
+    gs.append(G.BodyMatchesIntended(ignore_whitespace=a.html))
     if a.body_must_not_contain:
         gs.append(G.BodyMustNotContain(a.body_must_not_contain))
     if a.body_must_contain:
@@ -67,6 +67,9 @@ def _main(argv=None) -> int:
     c.add_argument("--to", default=""); c.add_argument("--cc", default=""); c.add_argument("--bcc", default="")
     c.add_argument("--subject", default="")
     c.add_argument("--body-file", required=True)
+    c.add_argument("--html", action="store_true",
+                   help="--body-file is HTML (tables, bold, lists): pasted as is, and checked as its text "
+                        "with whitespace ignored, since table cells render with tabs the source lacks")
     c.add_argument("--reply-to", default="", help="regex matching the message to reply to; recipients "
                                                  "and threading then come from Outlook, not from --to")
     c.add_argument("--send", action="store_true", help="send once every guard passes")
@@ -199,14 +202,15 @@ def _main(argv=None) -> int:
                 m.add_recipients(well, val)
         if not a.reply_to:
             m.set_subject(a.subject)
-        m.set_body(text, replace=not a.reply_to,
-                   drop_signature=a.drop_signature or bool(a.reply_to))
+        (m.set_body_html if a.html else m.set_body)(
+            text, replace=not a.reply_to, drop_signature=a.drop_signature or bool(a.reply_to))
     except OutlookError as e:
         print(f"ABORT (draft left open, NOT sent): {e}", file=sys.stderr)
         return 3
 
     draft = m.snapshot(intended_to=a.to, intended_cc=a.cc, intended_bcc=a.bcc,
-                       intended_subject=a.subject, intended_body=text, is_reply=bool(a.reply_to))
+                       intended_subject=a.subject, intended_body=html_to_text(text) if a.html else text,
+                       is_reply=bool(a.reply_to))
     if a.shot:
         s.screenshot(a.shot)
     problems = G.run(build_guards(a), draft)
